@@ -97,18 +97,25 @@ my-project/
   .git                pointer: "gitdir: ./.bare"
   main/               worktree for the main branch
   feature-auth/       worktree for feature-auth branch
+  feat/my-feature/    worktree for feat/my-feature branch
   fix-bug/            worktree for fix-bug branch
 ```
 
 Each worktree directory is a fully independent working tree. You can have
 multiple branches open simultaneously without stashing or switching.
 
-> **Invariant**: each worktree directory holds the branch of the same name
+> **Invariant**: each worktree path relative to the project root matches its branch name
 > (`feature-auth/` is on branch `feature-auth`, `main/` is on branch `main`).
 > zproj enforces this on `create`/`fork`. If you manually `git checkout` a
 > different branch inside a worktree, `zproj launch`, `fork`, `join`, and
 > `update` will warn — operations like `update` resolve the source by branch
 > name and will silently target the wrong branch otherwise.
+
+Branch names containing `/` use nested directories. For example,
+`zproj init my-project --main feat/my-feature` creates
+`my-project/feat/my-feature/`. You can open that worktree with
+`zproj my-project/feat/my-feature` or, from the project root,
+`zproj feat/my-feature`.
 
 ### Copying ignored files into new worktrees
 
@@ -333,10 +340,10 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-438 tests pass by default; the one slow Lima VM test (`LM5`) is skipped unless
-you set `ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed, in which case all
-439 run with none skipped. Coverage includes init, clone, upgrade, worktree
-management, fork/update/join, review workflow, tmux binding installation,
+The slow Lima VM test (`LM5`) is skipped unless you set
+`ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed. Tests for other optional
+tools are skipped when those tools are unavailable. Coverage includes init,
+clone, upgrade, worktree management, fork/update/join, review workflow, tmux binding installation,
 diagnostics, integrate, notify, Lima sandbox flags, and tool detection.
 Requires tmux, git, and bash in `PATH`. The suite uses a dedicated tmux server
 socket (`ZPROJ_TEST_TMUX_SOCKET`) so it does not attach to or mutate your
