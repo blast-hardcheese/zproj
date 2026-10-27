@@ -3,8 +3,8 @@
 ## Project
 
 Single-file bash script (`zproj`) managing parallel git worktrees with tmux.
-Each worktree gets a tmux window with a 3-pane layout (coding agent, editor,
-shell). Includes a review workflow for annotating diffs and dispatching notes.
+Each worktree gets a tmux window with a 2-pane layout (coding agent and shell).
+Includes a review workflow for annotating diffs and dispatching notes.
 
 `README.md` contains user-facing docs.
 
