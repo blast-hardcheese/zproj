@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.1"
+readonly VERSION="4.18.2"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -443,76 +443,6 @@ _tmux_config_path() {
   local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
   [[ -f "$xdg" ]] && echo "$xdg" && return
   echo "$HOME/.tmux.conf"
-}
-
-# Return mtime of $1 as epoch seconds. Tries macOS stat first, falls back to GNU.
-_notify_stat_mtime() {
-  local file="$1"
-  stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0
-}
-
-# Debounce per pane: return 0 to proceed, 1 to suppress.
-# Uses mkdir atomicity for lock; checks mtime for cooldown expiry.
-# $1 = pane_id  $2 = cooldown_seconds (default 5)
-_notify_debounce() {
-  local pane_id="${1:-}" cooldown="${2:-5}"
-  [[ -z "$pane_id" ]] && return 0
-  local lock_dir="${TMPDIR:-/tmp}/zproj-notify-${pane_id}"
-  mkdir -p "${TMPDIR:-/tmp}"
-  if mkdir "$lock_dir" 2>/dev/null; then
-    return 0
-  fi
-  local now mtime age
-  now="$(date +%s)"
-  mtime="$(_notify_stat_mtime "$lock_dir")"
-  ((age = now - mtime)) || true
-  if [[ $age -lt $cooldown ]]; then
-    return 1
-  fi
-  rmdir "$lock_dir" 2>/dev/null || true
-  mkdir "$lock_dir" 2>/dev/null || true
-  return 0
-}
-
-# Return 0 if the running tmux is >= $1. Returns 1 if tmux absent or older.
-_notify_tmux_version_gte() {
-  local want="$1"
-  command -v tmux &>/dev/null || return 1
-  local ver
-  ver="$(_tmux -V 2>/dev/null | awk '{print $2}')" || return 1
-  _version_gte "$ver" "$want"
-}
-
-# OSC 777 is parsed as 777;notify;<title>;<body> with unescaped ';' in title/body.
-# Session or window names containing ';' break Ghostty/tmux passthrough: the tail
-# is left unconsumed and full-screen apps (nvim) show it as garbage until redraw.
-_notify_osc_sanitize_segment() {
-  local s="${1:-}"
-  s="${s//;/:}"
-  s="${s//$'\a'/ }"
-  s="${s//$'\n'/ }"
-  s="${s//$'\r'/ }"
-  s="${s//$'\033'/ }"
-  printf '%s' "$s"
-}
-
-# Send an OSC 777 desktop notification to $3 (default: /dev/stdout).
-# Inside tmux >= 3.2: uses DCS passthrough with doubled ESC.
-# Inside tmux < 3.2: emits plain BEL (only signal that passes through).
-# Outside tmux: emits plain OSC 777 (Ghostty handles directly).
-_notify_osc777() {
-  local title body tty="${3:-/dev/stdout}"
-  title="$(_notify_osc_sanitize_segment "${1:-}")"
-  body="$(_notify_osc_sanitize_segment "${2:-}")"
-  if [[ -n "${TMUX:-}" ]]; then
-    if _notify_tmux_version_gte "3.2"; then
-      printf '\033Ptmux;\033\033]777;notify;%s;%s\a\033\\' "$title" "$body" > "$tty" 2>/dev/null || true
-    else
-      printf '\a' > "$tty" 2>/dev/null || true
-    fi
-  else
-    printf '\033]777;notify;%s;%s\a' "$title" "$body" > "$tty" 2>/dev/null || true
-  fi
 }
 
 # Return a human-readable label for which config source resolved the editor.
@@ -2814,7 +2744,7 @@ ${BOLD}Usage:${RESET}
   $SCRIPT_NAME list [dir]                          Show worktrees with status
   $SCRIPT_NAME review <subcommand>                 Manage review notes (path/view/dispatch/clear)
   $SCRIPT_NAME integrate [--plan]                  Generate editor integration prompt for coding agent
-  $SCRIPT_NAME notify [session] [window] [pane]   Emit desktop notification (used by tmux hooks)
+  $SCRIPT_NAME notify [session] [window] [pane]   Legacy no-op for old tmux hooks
   $SCRIPT_NAME --env                               Show resolved editor and coding agent
   $SCRIPT_NAME --diagnostics                       Check environment for problems
   $SCRIPT_NAME --test                              Run the built-in test suite
@@ -3563,62 +3493,24 @@ cmd_diagnostics() {
   # ── Section: Notification pipeline ──────────────────────────────────────
   _section_header "Notification pipeline"
 
-  local _np_tmux_ver=""
   local _np_server_running=false
-  if command -v tmux &>/dev/null; then
-    _np_tmux_ver="$(_tmux -V 2>/dev/null | awk '{print $2}')" || _np_tmux_ver=""
-  fi
   if _tmux list-sessions &>/dev/null; then
     _np_server_running=true
   fi
 
-  # ── tmux layer (hooks + passthrough) — only if server is running ─────────
+  # ── tmux notification layer — only if server is running ──────────────────
   if ! command -v tmux &>/dev/null; then
     _diag_info "tmux hooks" "skipped (tmux not available)"
   elif ! $_np_server_running; then
     _diag_info "tmux hooks" "skipped (no tmux server running — start one with: tmux new-session)"
   else
-    # Check alert-bell hook
     local _np_conf
     _np_conf="$(_tmux_config_path)"
-    local _np_conf_has_bell=false _np_server_has_bell=false
-    grep -qE "alert-bell.*${SCRIPT_NAME} notify" "$_np_conf" 2>/dev/null && _np_conf_has_bell=true
-    _tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*${SCRIPT_NAME} notify" && _np_server_has_bell=true
-    if $_np_server_has_bell; then
-      _diag_ok "alert-bell hook" "loaded in server"
-    elif $_np_conf_has_bell; then
-      _diag_warn "alert-bell hook" "in config but not loaded — run: tmux source-file ${_np_conf}"
+    if grep -qE "^[[:space:]]*setw?[[:space:]]+-g[[:space:]]+monitor-silence[[:space:]]+45|^[[:space:]]*set-hook.*alert-(bell|silence).*zproj notify" \
+        "$_np_conf" 2>/dev/null; then
+      _diag_warn "zproj notification hooks" "legacy config present — run 'zproj integrate' to remove"
     else
-      _diag_info "alert-bell hook" "not configured — run '${SCRIPT_NAME} integrate' to set up"
-    fi
-
-    # Check alert-silence hook
-    local _np_conf_has_silence=false _np_server_has_silence=false
-    grep -qE "alert-silence.*${SCRIPT_NAME} notify" "$_np_conf" 2>/dev/null && _np_conf_has_silence=true
-    _tmux show-hooks -g 2>/dev/null | grep -qE "alert-silence.*${SCRIPT_NAME} notify" && _np_server_has_silence=true
-    if $_np_server_has_silence; then
-      _diag_ok "alert-silence hook" "loaded in server"
-    elif $_np_conf_has_silence; then
-      _diag_warn "alert-silence hook" "in config but not loaded — run: tmux source-file ${_np_conf}"
-    else
-      _diag_info "alert-silence hook" "not configured — run '${SCRIPT_NAME} integrate' to set up"
-    fi
-
-    # Check allow-passthrough (tmux 3.2+ only)
-    if [[ -n "$_np_tmux_ver" ]] && _version_gte "$_np_tmux_ver" "3.2"; then
-      local _np_live_pt
-      _np_live_pt="$(_tmux show -gv allow-passthrough 2>/dev/null)" || _np_live_pt=""
-      local _np_conf_has_pt=false
-      grep -qE "allow-passthrough[[:space:]]+all" "$(_tmux_config_path)" 2>/dev/null && _np_conf_has_pt=true
-      if [[ "$_np_live_pt" == "all" ]]; then
-        _diag_ok "allow-passthrough" "all (OSC 777 passthrough enabled)"
-      elif $_np_conf_has_pt; then
-        _diag_warn "allow-passthrough" "config has 'all' but server has '${_np_live_pt:-off}' — run: tmux source-file $(_tmux_config_path)"
-      else
-        _diag_info "allow-passthrough" "not set — run '${SCRIPT_NAME} integrate' to configure"
-      fi
-    else
-      _diag_info "allow-passthrough" "requires tmux 3.2+ (have ${_np_tmux_ver:-unknown}) — OSC 777 unavailable"
+      _diag_ok "notification source" "agent-emitted bells only"
     fi
   fi
 
@@ -3640,13 +3532,13 @@ cmd_diagnostics() {
     fi
     ;;
   iTerm.app|iterm2|WezTerm|wezterm|kitty|xterm-kitty)
-    _diag_info "terminal" "${_np_term} (check docs for OSC 777 notification support)${_np_ssh_note}"
+    _diag_info "terminal" "${_np_term} (check terminal bell notification settings)${_np_ssh_note}"
     ;;
   "")
     _diag_info "terminal" "unknown (\$TERM_PROGRAM not set)${_np_ssh_note}"
     ;;
   *)
-    _diag_info "terminal" "${_np_term} (check docs for OSC 777 notification support)${_np_ssh_note}"
+    _diag_info "terminal" "${_np_term} (check terminal bell notification settings)${_np_ssh_note}"
     ;;
   esac
 
@@ -4083,20 +3975,6 @@ _integrate_count_zproj_worktree_binds_file() {
   echo "$c"
 }
 
-# Remove notification marker and alert-bell / alert-silence notifier hooks so integrate
-# can re-add a single canonical copy (avoid duplicate set-hook chains in tmux.conf).
-_integrate_notify_marker_and_hooks_filtered_to_tmpfile() {
-  local src="$1" dst="$2"
-  awk -v s="$SCRIPT_NAME" '
-    $0 == "# " s " notification" { next }
-    /^set-hook / && index($0, "alert-bell") > 0 \
-      && index($0, s " notify") > 0 { next }
-    /^set-hook / && index($0, "alert-silence") > 0 \
-      && index($0, s " notify") > 0 { next }
-    { print }
-  ' "$src" > "$dst"
-}
-
 # Append canonical zproj tmux binds (prefix+N/X/F/J/U). Removes any prior integrated
 # block matching this script + #{pane_current_path} before re-append so integrate is idempotent.
 _integrate_install_tmux_bindings() {
@@ -4179,98 +4057,30 @@ TMUX_B
   step "  [added]  zproj worktree binds (${conf})"
 }
 
-# Old installs used `set-hook -ga` for notify hooks. Each `tmux source-file`
-# appended another duplicate handler (-ga stacks). Rewrite our notifier lines to
-# `set-hook -g` so reloads replace the hook instead.
-_integrate_notify_hooks_normalize_set_g_in_conf() {
-  local dry_run="${1:-false}"
-  local conf="$(_tmux_config_path)"
-  [[ -f "$conf" ]] || return 0
-  if ! grep -qE "set-hook -ga alert-(bell|silence).*${SCRIPT_NAME} notify" "$conf" 2>/dev/null; then
-    return 0
-  fi
-  if $dry_run; then
-    echo "  [would migrate] notifier hooks: replace set-hook -ga → set-hook -g in (${conf})"
-    return 0
-  fi
-  local tmp
-  tmp="$(mktemp)"
-  if ! awk -v s="$SCRIPT_NAME" '
-    {
-      line = $0
-      idx = index(line, s " notify")
-      if (idx > 0) {
-        if (line ~ /set-hook -ga alert-bell/) {
-          gsub(/set-hook -ga alert-bell/, "set-hook -g alert-bell", line)
-        }
-        if (line ~ /set-hook -ga alert-silence/) {
-          gsub(/set-hook -ga alert-silence/, "set-hook -g alert-silence", line)
-        }
-      }
-      print line
-    }
-  ' "$conf" > "$tmp"; then
-    rm -f "$tmp"
-    _err "normalize notify hooks (-ga→-g) failed (awk)"
-    return 1
-  fi
-  if cmp -s "$conf" "$tmp"; then
-    rm -f "$tmp"
-    return 0
-  fi
-  if ! mv "$tmp" "$conf"; then
-    rm -f "$tmp"
-    _err "normalize notify hooks (-ga→-g) failed (mv)"
-    return 1
-  fi
-  step "  [migrated]  notify hooks → set-hook -g (no stacking on source-file) (${conf})"
-}
-
 _integrate_install_notify_hooks() {
   local dry_run="${1:-false}"
   local conf
   conf="$(_tmux_config_path)"
 
-  # Strip notifier hooks + marker so repeating integrate never stacks duplicate hooks in tmux.conf.
-  if [[ -f "$conf" ]]; then
+  # Direct OSC writes from tmux hooks can corrupt an interactive pane, and
+  # silence monitoring marks every quiet window as needing attention. Remove
+  # only the exact legacy settings installed by zproj.
+  if [[ -f "$conf" ]] && grep -qE "^[[:space:]]*setw?[[:space:]]+-g[[:space:]]+monitor-silence[[:space:]]+45[[:space:]]*$|^[[:space:]]*set-hook.*alert-(bell|silence).*zproj notify" \
+      "$conf" 2>/dev/null; then
     if $dry_run; then
-      if grep -qFx "# ${SCRIPT_NAME} notification" "$conf" 2>/dev/null \
-        || grep -qE 'set-hook .*alert-(bell|silence).*'"$SCRIPT_NAME"' notify' "$conf" 2>/dev/null; then
-        echo "  [would refresh] notifier marker + bell/silence hooks (${conf})"
-      fi
+      echo "  [would remove]  legacy zproj notification hooks  (${conf})"
     else
-      local _nz_tmp
-      _nz_tmp="$(mktemp)"
-      _integrate_notify_marker_and_hooks_filtered_to_tmpfile "$conf" "$_nz_tmp"
-      if ! cmp -s "$conf" "$_nz_tmp" 2>/dev/null; then
-        if ! mv "$_nz_tmp" "$conf"; then
-          rm -f -- "$_nz_tmp"
-          _err "Notifier hook strip failed (${conf})"; return 1
-        fi
-        step "  [refreshed] removed notifier marker/hooks for rewrite (${conf})"
-      else
-        rm -f -- "$_nz_tmp"
-      fi
+      local tmp_conf
+      tmp_conf="$(mktemp "${TMPDIR:-/tmp}/zproj-tmux-conf-XXXXXX")"
+      awk '
+        /^[[:space:]]*setw?[[:space:]]+-g[[:space:]]+monitor-silence[[:space:]]+45[[:space:]]*$/ { next }
+        /^[[:space:]]*set-hook.*alert-(bell|silence).*zproj notify/ { next }
+        { print }
+      ' "$conf" > "$tmp_conf"
+      mv "$tmp_conf" "$conf"
+      step "  [removed]  legacy zproj notification hooks  (${conf})"
     fi
   fi
-
-  _integrate_notify_hooks_normalize_set_g_in_conf "$dry_run"
-
-  local tmux_ver=""
-  if command -v tmux &>/dev/null; then
-    tmux_ver="$(_tmux -V 2>/dev/null | awk '{print $2}')" || tmux_ver=""
-  fi
-
-  # Version-adaptive hook commands.
-  local run_shell_cmd="run-shell"
-  if [[ -n "$tmux_ver" ]] && _version_gte "$tmux_ver" "3.3"; then
-    run_shell_cmd="run-shell -b"
-  fi
-
-  local _bell_hook
-  _bell_hook="set-hook -g alert-bell '${run_shell_cmd} \"${SCRIPT_NAME} notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\"\"'"
-  local _silence_hook
-  _silence_hook="set-hook -g alert-silence '${run_shell_cmd} \"${SCRIPT_NAME} notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\" silence\"'"
 
   # Settings to install — each checked independently.
   # Format: "grep_pattern|||line_to_append"
@@ -4279,17 +4089,7 @@ _integrate_install_notify_hooks() {
     "monitor-bell on|||set -g monitor-bell on"
     "bell-action any|||set -g bell-action any"
     "window-status-bell-style|||set -g window-status-bell-style fg=white,bg=red,bold"
-    "monitor-silence|||setw -g monitor-silence 45"
-    "alert-bell.*${SCRIPT_NAME} notify|||${_bell_hook}"
-    "alert-silence.*${SCRIPT_NAME} notify|||${_silence_hook}"
   )
-
-  # allow-passthrough only on tmux 3.2+
-  local add_passthrough=false
-  if [[ -n "$tmux_ver" ]] && _version_gte "$tmux_ver" "3.2"; then
-    add_passthrough=true
-    _settings+=("allow-passthrough|||set -g allow-passthrough all")
-  fi
 
   local -a missing_lines=()
   local entry grep_pat line_val
@@ -4304,9 +4104,6 @@ _integrate_install_notify_hooks() {
   done
 
   if [[ ${#missing_lines[@]} -eq 0 ]]; then
-    if ! $add_passthrough && [[ -n "$tmux_ver" ]] && ! _version_gte "$tmux_ver" "3.2"; then
-      warn "tmux < 3.2 detected — OSC 777 desktop notifications require tmux 3.2+. Bell forwarding still works."
-    fi
     return 0
   fi
 
@@ -4314,9 +4111,6 @@ _integrate_install_notify_hooks() {
     for line_val in "${missing_lines[@]}"; do
       echo "  [would add]  ${line_val%%$'\n'*}  (${conf})"
     done
-    if ! $add_passthrough && [[ -n "$tmux_ver" ]]; then
-      echo "  [skip]  allow-passthrough  (requires tmux 3.2+, detected: ${tmux_ver})"
-    fi
     return 0
   fi
 
@@ -4349,10 +4143,6 @@ _integrate_install_notify_hooks() {
   for line_val in "${missing_lines[@]}"; do
     step "  [added]  ${line_val%%$'\n'*}  (${conf})"
   done
-
-  if ! $add_passthrough && [[ -n "$tmux_ver" ]]; then
-    warn "tmux < 3.2 — OSC 777 desktop notifications unavailable. Bell forwarding only."
-  fi
 }
 
 # Configure each installed coding agent to emit BEL on idle.
@@ -4483,17 +4273,17 @@ _integrate_configure_agents() {
     dim "  [not installed]  gemini"
   fi
 
-  # ── Silence-fallback agents (no terminal notification API) ────────────────
-  local _silence_agents=()
-  command -v amp    &>/dev/null && _silence_agents+=(amp)
-  command -v goose  &>/dev/null && _silence_agents+=(goose)
-  command -v hermes &>/dev/null && _silence_agents+=(hermes)
-  command -v agent  &>/dev/null && _silence_agents+=(agent)
+  # ── Agents without a terminal notification API ───────────────────────────
+  local _unsupported_agents=()
+  command -v amp   &>/dev/null && _unsupported_agents+=(amp)
+  command -v goose &>/dev/null && _unsupported_agents+=(goose)
+  command -v hermes &>/dev/null && _unsupported_agents+=(hermes)
+  command -v agent &>/dev/null && _unsupported_agents+=(agent)
 
-  if [[ ${#_silence_agents[@]} -gt 0 ]]; then
+  if [[ ${#_unsupported_agents[@]} -gt 0 ]]; then
     local ag
-    for ag in "${_silence_agents[@]}"; do
-      step "  [silence fallback]  ${ag}  (no terminal notification API — uses monitor-silence)"
+    for ag in "${_unsupported_agents[@]}"; do
+      dim "  [not configured]  ${ag}  (no terminal notification API)"
     done
   fi
 }
@@ -4521,25 +4311,9 @@ cmd_integrate() {
      echo -e "${BOLD}tmux bindings (dry run):${RESET}"
      _integrate_install_tmux_bindings true
      echo ""
-     echo -e "${BOLD}tmux notification hooks (dry run):${RESET}"
+     echo -e "${BOLD}tmux notification settings (dry run):${RESET}"
      _integrate_install_notify_hooks true
       dim "  Note: run 'tmux source-file $(_tmux_config_path)' to activate in the current server"
-      # Warn if running tmux server diverges from config
-      if command -v tmux &>/dev/null && _tmux list-sessions &>/dev/null; then
-        local _pi_conf
-        _pi_conf="$(_tmux_config_path)"
-        local _pi_conf_has_bell=false _pi_server_has_bell=false
-        grep -qE "alert-bell.*${SCRIPT_NAME} notify" "$_pi_conf" 2>/dev/null && _pi_conf_has_bell=true
-        _tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*${SCRIPT_NAME} notify" && _pi_server_has_bell=true
-        if $_pi_conf_has_bell && ! $_pi_server_has_bell; then
-          warn "  ⚠ hooks in config but not loaded in running tmux server — run: tmux source-file ${_pi_conf}"
-        fi
-        local _pi_live_pt
-        _pi_live_pt="$(_tmux show -gv allow-passthrough 2>/dev/null)" || _pi_live_pt=""
-        if grep -qE "allow-passthrough[[:space:]]+all" "$_pi_conf" 2>/dev/null && [[ "$_pi_live_pt" != "all" ]]; then
-          warn "  ⚠ allow-passthrough: config has 'all' but server has '${_pi_live_pt:-off}' — run: tmux source-file ${_pi_conf}"
-        fi
-      fi
       echo ""
       echo -e "${BOLD}agent notification config (dry run):${RESET}"
      _integrate_configure_agents true
@@ -4573,7 +4347,7 @@ cmd_integrate() {
   _integrate_install_tmux_bindings false
   echo ""
 
-  step "Installing tmux notification hooks..."
+  step "Installing tmux notification settings..."
   echo ""
   _integrate_install_notify_hooks false
   dim "  Note: run 'tmux source-file ~/.tmux.conf' to activate in the current server"
@@ -4640,39 +4414,8 @@ cmd_integrate() {
 }
 
 cmd_notify() {
-  # Called by tmux alert-bell hook: ${SCRIPT_NAME} notify <session> <window> <pane> [type]
-  # Also supports: ${SCRIPT_NAME} notify --help
-  case "${1:-}" in
-  --help|-h) usage_notify; return 0 ;;
-  esac
-
-  local session="${1:-}" window="${2:-}" pane="${3:-}" type="${4:-bell}"
-
-  # Outside tmux with no args: nothing to do
-  if [[ -z "${TMUX:-}" && -z "$session" ]]; then
-    return 0
-  fi
-
-  # Debounce: skip if same pane notified recently
-  if ! _notify_debounce "$pane" "${ZPROJ_NOTIFY_COOLDOWN:-5}"; then
-    return 0
-  fi
-
-  # Build notification content
-  local title body
-  if [[ "$type" == "silence" ]]; then
-    title="Agent Idle"
-  else
-    title="Agent Ready"
-  fi
-  body="${session} → ${window}"
-
-  # Discover all attached client ttys and notify each
-  local tty
-  while IFS= read -r tty; do
-    [[ -z "$tty" ]] && continue
-    _notify_osc777 "$title" "$body" "$tty"
-  done < <(_tmux list-clients -F '#{client_tty}' 2>/dev/null)
+  # Old tmux configs may still invoke this until integrate removes their hooks.
+  return 0
 }
 
 usage_integrate() {
@@ -4681,15 +4424,15 @@ usage_integrate() {
 ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
 
   Bootstraps your machine with three integration steps. Safe to run multiple
-  times: worktree key binds and notifier hooks are stripped and re-written in
-  tmux.conf instead of appending duplicates.
+  times: worktree key binds are refreshed, legacy notification hooks are
+  removed, and bell monitoring settings are added only when missing.
 
     1. Installs tmux keybindings for worktree management (create, delete,
        fork, join, update)
-    2. Installs tmux alert hooks so bells from a coding agent pane run
-       ${SCRIPT_NAME} notify (OSC 777 desktop notification on supported hosts).
-       Older ${SCRIPT_NAME} configs that used set-hook -ga (which stacks
-       handlers on every tmux source-file reload) are rewritten to -g.
+    2. Configures the notification pipeline — enables tmux bell monitoring
+       and configures each installed agent (claude, aider, codex, gemini)
+       to emit BEL when idle. No tmux alert hooks or silence monitoring are
+       installed.
     3. Asks your coding agent to implement the review workflow in your editor
        (add note / view / dispatch / clear)
 
@@ -4701,46 +4444,9 @@ ${BOLD}Environment:${RESET}
   ZPROJ_INTEGRATE_DELAY   Seconds to wait for agent TUI before sending the
                           handoff message (default: 2). Increase if your
                           agent starts slowly.
-  ZPROJ_NOTIFY_COOLDOWN   Notification debounce cooldown in seconds
-                          (default: 5). Reduce for faster notifications.
-
 ${BOLD}Examples:${RESET}
   $SCRIPT_NAME integrate              ${DIM}# full bootstrap${RESET}
   $SCRIPT_NAME integrate --plan       ${DIM}# preview without executing${RESET}
-
-EOF
-}
-
-usage_notify() {
-  cat <<EOF
-
-${BOLD}Usage:${RESET} $SCRIPT_NAME notify [session] [window] [pane] [type]
-
-  Called automatically by tmux alert-bell and alert-silence hooks to deliver
-  desktop notifications when a coding agent in a pane becomes idle.
-
-  Arguments are passed by tmux hooks using format variables:
-    session   #{hook_session}  — tmux session name (project)
-    window    #{hook_window}   — tmux window name (worktree)
-    pane      #{hook_pane}     — tmux pane ID (e.g., %3)
-    type      bell|silence     — notification trigger type (default: bell)
-
-  Notifications are debounced per pane (default 5s).
-  Set \$ZPROJ_NOTIFY_COOLDOWN to override the debounce period.
-  Session/window names containing ';' or control characters are sanitized for
-  OSC 777 — raw ';' in those names would break the terminal notifier and can
-  litter full-screen apps until they redraw.
-
-  Outside tmux with no arguments: exits silently (safe to call from scripts).
-
-${BOLD}Options:${RESET}
-  --help, -h               Show this help
-
-${BOLD}Environment:${RESET}
-  ZPROJ_NOTIFY_COOLDOWN   Debounce cooldown in seconds (default: 5)
-
-${BOLD}Example tmux hook (installed by ${SCRIPT_NAME} integrate):${RESET}
-  set-hook -g alert-bell 'run-shell -b "'"'"${SCRIPT_NAME}"'"' notify \\"#{hook_session}\\" \\"#{hook_window}\\" \\"#{hook_pane}\\""'
 
 EOF
 }
@@ -5281,17 +4987,17 @@ STUB
 
   fi  # end: command -v opencode
 
-  _section "A10 — agent: hermes is a known agent and gets the silence fallback"
+  _section "A10 — agent: hermes is a known agent without a terminal notification API"
   # `hermes` is in _KNOWN_AGENTS so auto-discovery picks it up when present,
-  # and integrate routes it through the monitor-silence fallback (no BEL API).
+  # and integrate reports it as unsupported (no BEL API).
   local a10_in_known=1
   local a10_ag
   for a10_ag in "${_KNOWN_AGENTS[@]}"; do
     [[ "$a10_ag" == hermes ]] && a10_in_known=0
   done
   _t_check "A10: hermes listed in _KNOWN_AGENTS" test "$a10_in_known" -eq 0
-  _t_check "A10: hermes is wired into the silence-fallback block" \
-    grep -qE 'command -v hermes.*_silence_agents\+=\(hermes\)' "$_ZPROJ_SELF"
+  _t_check "A10: hermes is reported as unsupported for terminal notifications" \
+    grep -qE 'command -v hermes.*_unsupported_agents\+=\(hermes\)' "$_ZPROJ_SELF"
 
   # ── Section: _repo_preferred_cursor / cursor repo detection ──────────────
 
@@ -6244,8 +5950,6 @@ NOTES
   local -a s5_allowlist=(
     _list_process_entry             # called as a function inside a loop in cmd_list
     _integrate_install_notify_hooks # called by cmd_integrate (integration step)
-    _notify_debounce                # called by cmd_notify (wired in task 5)
-    _notify_osc777                  # called by cmd_notify (wired in task 5)
   )
 
   local s5_dead=""
@@ -7144,55 +6848,10 @@ TI7EOF
 
   # ── Section: NT — notification helpers ───────────────────────────────────
 
-  _section "NT1 — notify: _notify_stat_mtime returns epoch seconds"
-  local nt1_tmp
-  nt1_tmp="$(mktemp)"
-  _t_grep "NT1: stat_mtime returns digits"  "^[0-9]"  _notify_stat_mtime "$nt1_tmp"
-  rm -f "$nt1_tmp" || true
-
-  _section "NT2 — notify: _notify_debounce allows first call"
-  local nt2_lock
-  nt2_lock="${TMPDIR:-/tmp}/zproj-notify-%nt2test"
-  rm -rf "$nt2_lock" 2>/dev/null || true
-  _t_check "NT2: first debounce succeeds"  _notify_debounce "%nt2test" 5
-  rm -rf "$nt2_lock" 2>/dev/null || true
-
-  _section "NT3 — notify: _notify_debounce suppresses within cooldown"
-  local nt3_lock nt3_ec
-  nt3_lock="${TMPDIR:-/tmp}/zproj-notify-%nt3test"
-  rm -rf "$nt3_lock" 2>/dev/null || true
-  mkdir "$nt3_lock" 2>/dev/null || true
-  nt3_ec=0
-  _notify_debounce "%nt3test" 300 || nt3_ec=$?
-  _t_check "NT3: debounce returns 1 (suppressed)"  test "$nt3_ec" -eq 1
-  rm -rf "$nt3_lock" 2>/dev/null || true
-
-  _section "NT4 — notify: _notify_debounce allows after cooldown expires"
-  local nt4_lock
-  nt4_lock="${TMPDIR:-/tmp}/zproj-notify-%nt4test"
-  rm -rf "$nt4_lock" 2>/dev/null || true
-  mkdir "$nt4_lock" 2>/dev/null || true
-  touch -t 200001010000 "$nt4_lock" 2>/dev/null || true
-  _t_check "NT4: debounce allows after expiry"  _notify_debounce "%nt4test" 5
-  rm -rf "$nt4_lock" 2>/dev/null || true
-
-  _section "NT5 — notify: _notify_osc777 emits OSC 777 outside tmux"
-  local nt5_out
-  nt5_out="$(TMUX='' _notify_osc777 "TestTitle" "TestBody" 2>/dev/null)" || true
-  _t_grep "NT5: contains 777;notify"  "777;notify"  printf '%s' "$nt5_out"
-
-  _section "NT6 — notify: _notify_osc777 includes title and body"
-  local nt6_out
-  nt6_out="$(TMUX='' _notify_osc777 "MyTitle" "MyBody" 2>/dev/null)" || true
-  _t_grep "NT6: title and body present"  "MyTitle.*MyBody"  printf '%s' "$nt6_out"
-
-  _section "NT6b — notify: OSC 777 sanitizes delimiters in title/body"
-  local nt6b_out
-  nt6b_out="$(TMUX='' _notify_osc777 'a;b' $'c\nd' 2>/dev/null)" || true
-  _t_grep "NT6b: semicolons escaped in payload"  "777;notify;a:b;c d"  printf '%s' "$nt6b_out"
-
-  _section "NT7 — notify: SCRIPT_NAME notify --help exits 0 with usage"
-  _t_grep "NT7: help shows usage"  "notify"  "$BASH" "$_ZPROJ_SELF" notify --help
+  _section "NT7 — notify: legacy command is a silent no-op"
+  local nt7_out
+  nt7_out="$("$BASH" "$_ZPROJ_SELF" notify --help 2>&1)" || true
+  _t_check "NT7: legacy command produces no output"  test -z "$nt7_out"
 
   _section "NT8 — notify: SCRIPT_NAME notify outside tmux exits silently"
   local nt8_out
@@ -7205,24 +6864,23 @@ TI7EOF
   nt9_conf="${nt9_home}/.tmux.conf"
   ( HOME="$nt9_home" _integrate_install_notify_hooks false &>/dev/null )
   _t_check "NT9: config file created"      test -f "$nt9_conf"
-  _t_grep  "NT9: has SCRIPT_NAME notification"   "${SCRIPT_NAME} notification"        cat "$nt9_conf"
-  _t_grep  "NT9: has alert-bell hook"      "alert-bell.*${SCRIPT_NAME} notify"  cat "$nt9_conf"
-  _t_grep  "NT9: has monitor-silence"      "monitor-silence"           cat "$nt9_conf"
+  _t_grep  "NT9: has zproj notification"   "zproj notification"        cat "$nt9_conf"
+  _t_grep  "NT9: has monitor-bell"          "monitor-bell on"           cat "$nt9_conf"
+  _t_check "NT9: no alert-bell hook"        bash -c '! grep -q alert-bell "$1"' -- "$nt9_conf"
+  _t_check "NT9: no monitor-silence"       bash -c '! grep -q monitor-silence "$1"' -- "$nt9_conf"
+  _t_check "NT9: no alert-silence hook"    bash -c '! grep -q alert-silence "$1"' -- "$nt9_conf"
+  _t_check "NT9: no passthrough config"     bash -c '! grep -q allow-passthrough "$1"' -- "$nt9_conf"
   rm -rf "$nt9_home" || true
 
   _section "NT10 — notify hooks: idempotent"
-  local nt10_home nt10_conf nt10_nh nt10_nh2 nt10_mk
+  local nt10_home nt10_conf nt10_before nt10_after
   nt10_home="$(mktemp -d)"
   nt10_conf="${nt10_home}/.tmux.conf"
   ( HOME="$nt10_home" _integrate_install_notify_hooks false &>/dev/null )
-  local nt10_nh
-  nt10_nh="$(grep -cE '^set-hook .*alert-bell' "$nt10_conf" 2>/dev/null || true)"
-  _t_check "NT10: first install one alert-bell" test "$nt10_nh" -eq 1
+  nt10_before="$(wc -l < "$nt10_conf")"
   ( HOME="$nt10_home" _integrate_install_notify_hooks false &>/dev/null )
-  nt10_nh2="$(grep -cE '^set-hook .*alert-bell' "$nt10_conf" 2>/dev/null || true)"
-  nt10_mk="$(grep -cFx "# ${SCRIPT_NAME} notification" "$nt10_conf" 2>/dev/null || true)"
-  _t_check "NT10: alert-bell hook stays single" test "$nt10_nh2" -eq 1
-  _t_check "NT10: notification marker not duplicated" test "$nt10_mk" -eq 1
+  nt10_after="$(wc -l < "$nt10_conf")"
+  _t_check "NT10: line count unchanged" test "$nt10_before" -eq "$nt10_after"
   rm -rf "$nt10_home" || true
 
   _section "NT11 — notify hooks: dry-run writes nothing"
@@ -7241,8 +6899,25 @@ TI7EOF
   printf 'set -g mouse on\n' > "$nt12_conf"
   ( HOME="$nt12_home" _integrate_install_notify_hooks false &>/dev/null )
   _t_grep "NT12: original content preserved"  "set -g mouse on"           cat "$nt12_conf"
-  _t_grep "NT12: hooks added"                 "alert-bell.*${SCRIPT_NAME} notify"  cat "$nt12_conf"
+  _t_grep "NT12: bell monitoring added"       "monitor-bell on"  cat "$nt12_conf"
   rm -rf "$nt12_home" || true
+
+  _section "NT31 — notify hooks: removes legacy hooks and silence monitoring"
+  local nt31_home nt31_conf
+  nt31_home="$(mktemp -d)"
+  nt31_conf="${nt31_home}/.tmux.conf"
+  cat > "$nt31_conf" <<'NT31EOF'
+# zproj notification
+set-hook -ga alert-bell 'run-shell -b "zproj notify \"#{hook_session}\" \"#{hook_window}\" \"#{hook_pane}\""'
+set-hook -ga alert-silence 'run-shell -b "zproj notify \"#{hook_session}\" \"#{hook_window}\" \"#{hook_pane}\" silence"'
+setw -g monitor-silence 45
+NT31EOF
+  ( HOME="$nt31_home" _integrate_install_notify_hooks false &>/dev/null )
+  _t_check "NT31: bell hook removed"           bash -c '! grep -q "alert-bell" "$1"' -- "$nt31_conf"
+  _t_check "NT31: silence hook removed"        bash -c '! grep -q "alert-silence" "$1"' -- "$nt31_conf"
+  _t_check "NT31: monitor-silence removed"     bash -c '! grep -q "monitor-silence" "$1"' -- "$nt31_conf"
+  _t_grep  "NT31: monitor-bell retained"       "monitor-bell on"  cat "$nt31_conf"
+  rm -rf "$nt31_home" || true
 
   _section "NT13 — agent config: dry-run writes nothing"
   local nt13_home nt13_out
@@ -7279,7 +6954,7 @@ TI7EOF
   _section "NT16 — integrate --plan: includes notification section"
   local nt16_out
   nt16_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)"
-  _t_grep "NT16: plan mentions notification hooks"  "notification hooks"  echo "$nt16_out"
+  _t_grep "NT16: plan mentions notification settings"  "notification settings"  echo "$nt16_out"
   _t_grep "NT16: plan mentions agent config"        "agent notification"  echo "$nt16_out"
 
   _section "NT17 — integrate --plan: I-section not regressed"
@@ -7354,27 +7029,22 @@ TI7EOF
   _t_grep "NT24: notification pipeline section present"  \
     "[Nn]otification pipeline"  echo "$nt24_out"
 
-  _section "NT25 — diagnostics: alert-bell hook shown when server running"
+  _section "NT25 — diagnostics: agent-emitted bell source shown when server running"
   if ! command -v tmux &>/dev/null || ! _tmux list-sessions &>/dev/null; then
     _t_skip "NT25 (no tmux server)"
   else
     _tmux source-file "$(_tmux_config_path)" 2>/dev/null || true
     local nt25_out
     nt25_out="$(_zproj --diagnostics 2>&1)" || true
-    _t_grep "NT25: alert-bell hook shown"  "alert-bell"  echo "$nt25_out"
+    _t_check "NT25: notification source shown" \
+      bash -c '[[ "$1" == *"agent-emitted bells only"* || "$1" == *"legacy config present"* ]]' -- "$nt25_out"
   fi
 
-  _section "NT26 — diagnostics: allow-passthrough shown when server running"
-  if ! command -v tmux &>/dev/null || ! _tmux list-sessions &>/dev/null; then
-    _t_skip "NT26 (no tmux server)"
-  elif ! _version_gte "$(_tmux -V 2>/dev/null | awk '{print $2}')" "3.2"; then
-    _t_skip "NT26 (tmux < 3.2)"
-  else
-    _tmux set -g allow-passthrough all 2>/dev/null || true
-    local nt26_out
-    nt26_out="$(_zproj --diagnostics 2>&1)" || true
-    _t_grep "NT26: allow-passthrough shown"  "allow-passthrough"  echo "$nt26_out"
-  fi
+  _section "NT26 — diagnostics: allow-passthrough is not required"
+  local nt26_out
+  nt26_out="$(_zproj --diagnostics 2>&1)" || true
+  _t_check "NT26: diagnostics do not require allow-passthrough" \
+    bash -c '[[ "$1" != *"allow-passthrough"* ]]' -- "$nt26_out"
 
   _section "NT27 — diagnostics: terminal emulator detection reports TERM_PROGRAM"
   local nt27_out
@@ -7386,47 +7056,41 @@ TI7EOF
   nt28_out="$(TERM_PROGRAM= _zproj --diagnostics 2>&1)" || true
   _t_grep "NT28: unknown terminal shown"  "unknown"  echo "$nt28_out"
 
-  _section "NT29 — integrate --plan: divergence warning when hooks in config but not server"
-  if ! command -v tmux &>/dev/null; then
-    _t_skip "NT29 (tmux not available)"
-  else
-    local nt29_home nt29_socket
-    nt29_home="$(mktemp -d)"
-    # Write tmux config with hooks (matching the grep pattern)
-    printf '# '"${SCRIPT_NAME}"' notification\nset-hook -ga alert-bell run-shell "'"${SCRIPT_NAME}"' notify"\n' \
-      > "$nt29_home/.tmux.conf"
-    # Start isolated tmux server with NO hooks (empty config: /dev/null)
-    tmux -L nt29test -f /dev/null new-session -d -s nt29 2>/dev/null || true
-    nt29_socket="$(tmux -L nt29test display-message -p '#{socket_path}' 2>/dev/null)" || nt29_socket=""
-    if [[ -z "$nt29_socket" ]]; then
-      _t_skip "NT29 (could not start isolated tmux server)"
-    else
-      local nt29_out nt29_pid
-      nt29_pid="$(tmux -L nt29test display-message -p '#{pid}' 2>/dev/null)" || nt29_pid="0"
-      # Child must not use the self-test tmux socket; rely on TMUX=… (nt29test) for
-      # server-side checks, while HOME supplies a config file that claims hooks.
-      nt29_out="$(HOME="$nt29_home" TMUX="${nt29_socket},${nt29_pid},0" \
-        ZPROJ_TEST_NO_ATTACH=1 ZPROJ_TEST_TMUX_SOCKET= "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)" || true
-      _t_grep "NT29: divergence warning shown"  "config but not loaded"  \
-        echo "$nt29_out"
-      tmux -L nt29test kill-server 2>/dev/null || true
-    fi
-    rm -rf "$nt29_home" || true
-  fi
+  _section "NT29 — integrate --plan: reports legacy hook removal"
+  local nt29_home nt29_out
+  nt29_home="$(mktemp -d)"
+  printf '# zproj notification\nset-hook -ga alert-bell run-shell "zproj notify"\n' \
+    > "$nt29_home/.tmux.conf"
+  nt29_out="$(HOME="$nt29_home" ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)" || true
+  _t_grep "NT29: legacy hook removal shown"  "would remove.*legacy zproj notification hooks"  echo "$nt29_out"
+  rm -rf "$nt29_home" || true
 
-  _section "NT32 — notify hooks: migrate -ga to -g when notifier present"
+  _section "NT32 — notify hooks: remove legacy notifier when present"
   local nt32_home nt32_conf
   nt32_home="$(mktemp -d)"
   nt32_conf="${nt32_home}/.tmux.conf"
   printf 'set-hook -ga alert-bell "noop %s notify noop"\n' "${SCRIPT_NAME}" > "$nt32_conf"
   ( HOME="$nt32_home" _integrate_install_notify_hooks false &>/dev/null )
-  _t_grep "NT32: alert-bell uses set-hook -g" "set-hook -g alert-bell" cat "$nt32_conf"
+  _t_check "NT32: no notifier hooks remain" bash -c '! grep -q "alert-bell" "$1"' -- "$nt32_conf"
   if grep -qE 'set-hook -ga alert-(bell|silence).*'"${SCRIPT_NAME}"' notify' "$nt32_conf"; then
     _t_fail "NT32: -ga notifier lines remain"
   else
     _t_pass "NT32: no -ga lines for ${SCRIPT_NAME} notify"
   fi
   rm -rf "$nt32_home" || true
+
+  _section "NT33 — notify: old hook invocation never contacts tmux"
+  local nt33_home nt33_out nt33_exit=0
+  nt33_home="$(mktemp -d)"
+  mkdir -p "$nt33_home/bin"
+  printf '%s\n' '#!/bin/sh' 'touch "$ZPROJ_NOTIFY_TEST_LOG"' > "$nt33_home/bin/tmux"
+  chmod +x "$nt33_home/bin/tmux"
+  nt33_out="$(TMUX=fake PATH="$nt33_home/bin:$PATH" ZPROJ_NOTIFY_TEST_LOG="$nt33_home/called" \
+    "$BASH" "$_ZPROJ_SELF" notify project worktree %oldhook bell 2>&1)" || nt33_exit=$?
+  _t_check "NT33: exits successfully" test "$nt33_exit" -eq 0
+  _t_check "NT33: emits no output" test -z "$nt33_out"
+  _t_check "NT33: never queries client TTYs" test ! -e "$nt33_home/called"
+  rm -rf "$nt33_home" || true
 
   # ── Section: Lima sandbox ───────────────────────────────────────────────────
 
