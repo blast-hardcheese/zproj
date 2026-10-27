@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.1"
+readonly VERSION="4.18.2"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -1635,6 +1635,14 @@ cmd_create() {
     [[ -z "$from_ref" ]] && die "Could not determine base ref. Use --from <ref>."
   fi
 
+  # Default-branch detection returns a short branch name because clone/init
+  # use it as a worktree name. Resolve that name through origin when the local
+  # branch has not been created yet.
+  if ! git -C "$PARENT_DIR" rev-parse --verify "${from_ref}^{commit}" &>/dev/null && \
+     git -C "$PARENT_DIR" rev-parse --verify "refs/remotes/origin/${from_ref}^{commit}" &>/dev/null; then
+    from_ref="origin/$from_ref"
+  fi
+
   # Validate the from-ref exists
   if ! git -C "$PARENT_DIR" rev-parse --verify "${from_ref}^{commit}" &>/dev/null; then
     die "Base ref '$from_ref' does not exist or is not a commit."
@@ -1646,8 +1654,12 @@ cmd_create() {
     die "Failed to create worktree. Does the branch '$WORKTREE_NAME' already exist?"
 
   # Set upstream if the base was a remote branch
-  if git -C "$PROJECT_DIR" rev-parse --verify "refs/remotes/origin/$from_ref" &>/dev/null; then
-    git -C "$PROJECT_DIR" branch --set-upstream-to="origin/$from_ref" "$WORKTREE_NAME" --quiet 2>/dev/null || true
+  local upstream_ref="$from_ref"
+  if [[ "$upstream_ref" != origin/* ]]; then
+    upstream_ref="origin/$upstream_ref"
+  fi
+  if git -C "$PROJECT_DIR" rev-parse --verify "refs/remotes/$upstream_ref" &>/dev/null; then
+    git -C "$PROJECT_DIR" branch --set-upstream-to="$upstream_ref" "$WORKTREE_NAME" --quiet 2>/dev/null || true
   fi
 
   info "Created worktree ${BOLD}${WORKTREE_NAME}${RESET} → branch ${CYAN}${WORKTREE_NAME}${RESET}"
@@ -4815,6 +4827,51 @@ cmd_test() {
     echo ""
     echo -e "${BOLD}$*${RESET}"
   }
+
+  _section "RD1 — create: remote-only default branch"
+
+  local rd1_seed="$tmp/rd1-seed"
+  local rd1_root="$tmp/rd1-root"
+  git init -q -b dev "$rd1_seed"
+  git -C "$rd1_seed" config user.email "test@example.com"
+  git -C "$rd1_seed" config user.name "Test"
+  touch "$rd1_seed/README.md"
+  git -C "$rd1_seed" add README.md
+  git -C "$rd1_seed" commit -q -m "initial"
+
+  mkdir -p "$rd1_root"
+  git init -q --bare "$rd1_root/$BARE_DIR"
+  printf 'gitdir: ./%s\n' "$BARE_DIR" > "$rd1_root/$GIT_POINTER"
+  git -C "$rd1_root" remote add origin "$rd1_seed"
+  git -C "$rd1_root" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git -C "$rd1_root" fetch -q origin
+  git -C "$rd1_root" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/dev
+  git -C "$rd1_root" symbolic-ref HEAD refs/heads/dev
+
+  (cd "$rd1_root" && "$BASH" "$_ZPROJ_SELF" create feature-remote 2>/dev/null) || true
+
+  _t_check "RD1: creates from remote default without local branch" \
+    test -d "$rd1_root/feature-remote"
+  _t_grep "RD1: tracks remote default branch" "^origin/dev$" \
+    git -C "$rd1_root/feature-remote" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'
+
+  _section "RD2 — create: explicit remote base keeps upstream tracking"
+  (cd "$rd1_root" && "$BASH" "$_ZPROJ_SELF" create explicit-remote --from origin/dev &>/dev/null) || true
+  _t_check "RD2: remote base creates worktree" test -d "$rd1_root/explicit-remote"
+  _t_grep "RD2: tracks origin/dev without duplicate prefix" "^origin/dev$" \
+    git -C "$rd1_root/explicit-remote" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'
+
+  _section "RD3 — create: existing local default takes precedence"
+  local rd3_local_tip
+  rd3_local_tip="$(git -C "$rd1_root" rev-parse refs/remotes/origin/dev)"
+  git -C "$rd1_root" branch dev "$rd3_local_tip"
+  git -C "$rd1_seed" commit --allow-empty -q -m "remote ahead"
+  git -C "$rd1_root" fetch -q origin
+  (cd "$rd1_root" && "$BASH" "$_ZPROJ_SELF" create local-default &>/dev/null) || true
+  _t_check "RD3: uses existing local branch commit" \
+    test "$(git -C "$rd1_root/local-default" rev-parse HEAD)" = "$rd3_local_tip"
+  _t_grep "RD3: retains default remote tracking" "^origin/dev$" \
+    git -C "$rd1_root/local-default" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'
 
   # ── Section: fresh init ───────────────────────────────────────────────────
 
