@@ -110,6 +110,25 @@ multiple branches open simultaneously without stashing or switching.
 > `update` will warn — operations like `update` resolve the source by branch
 > name and will silently target the wrong branch otherwise.
 
+### Copying ignored files into new worktrees
+
+Add a `.worktreeinclude` file to a worktree root to copy selected local files
+when `zproj create` or `zproj fork` creates another worktree. Patterns use
+`.gitignore` syntax, including comments, negation, directory patterns, and
+globstars. Only paths that both match `.worktreeinclude` and are ignored by
+Git are copied; tracked and non-ignored files are never duplicated.
+
+```gitignore
+.env
+.env.local
+config/secrets.json
+node_modules/
+```
+
+`zproj create --from <ref>` copies from the existing worktree for that ref,
+falling back to the default-branch worktree. `zproj fork` copies from its
+explicit source. Existing target paths are never overwritten.
+
 ### Tmux layout
 
 One tmux **session** per project, one **window** per worktree. Each window has
@@ -202,8 +221,10 @@ zproj join main              # CWD → main
 ```
 
 Only committed state is forked/joined/updated. Uncommitted changes produce a
-warning but don't block the operation. If the source has uncommitted changes
-at join time, it is preserved (not deleted) even on a successful merge.
+warning but don't block the operation. Gitignored paths selected by
+`.worktreeinclude` are copied separately when forking. If the source has
+uncommitted changes at join time, it is preserved (not deleted) even on a
+successful merge.
 
 If a `join` or `update` hits merge conflicts, the merge is aborted and the
 diff is sent to the coding agent in the target worktree with instructions.

@@ -4,9 +4,10 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.1"
+readonly VERSION="4.19.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
+readonly WORKTREE_INCLUDE=".worktreeinclude"
 readonly MIN_GIT_VERSION="2.5.0"
 readonly MIN_TMUX_VERSION="3.0"
 readonly REVIEW_NOTES_RELPATH=".agents/plans/review-notes.md"
@@ -354,6 +355,127 @@ _git_default_branch() {
   done
 
   return 1
+}
+
+# Find the worktree whose local files should seed a new worktree. Prefer the
+# worktree for the requested base ref, then the default-branch worktree.
+# Prints an absolute path, or returns 1 when no suitable source exists.
+_worktreeinclude_source() {
+  local repo_root="$1" ref="$2"
+  local branch
+  case "$ref" in
+    refs/heads/*) branch="${ref#refs/heads/}" ;;
+    refs/remotes/*/*)
+      branch="${ref#refs/remotes/}"
+      branch="${branch#*/}"
+      ;;
+    origin/*) branch="${ref#origin/}" ;;
+    *) branch="$ref" ;;
+  esac
+
+  local default_branch
+  default_branch="$(_git_default_branch "$repo_root")" || return 1
+
+  local desired previous="" wt_path="" wt_branch="" line
+  for desired in "$branch" "$default_branch"; do
+    [[ -z "$desired" || "$desired" == "$previous" ]] && continue
+    previous="$desired"
+    wt_path=""
+    wt_branch=""
+    while IFS= read -r line; do
+      case "$line" in
+        "worktree "*) wt_path="${line#worktree }" ;;
+        "branch "*) wt_branch="${line#branch refs/heads/}" ;;
+        "")
+          if [[ "$wt_branch" == "$desired" && -d "$wt_path" ]]; then
+            echo "$wt_path"
+            return 0
+          fi
+          wt_path=""
+          wt_branch=""
+          ;;
+      esac
+    done < <(git -C "$repo_root" worktree list --porcelain 2>/dev/null)
+    if [[ "$wt_branch" == "$desired" && -d "$wt_path" ]]; then
+      echo "$wt_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Copy source paths selected by .worktreeinclude into a newly-created
+# worktree. Git performs both pattern evaluations: the first command applies
+# .worktreeinclude, and check-ignore intersects that result with Git's normal
+# ignore rules. NUL delimiters preserve spaces and newlines in pathnames.
+_worktreeinclude_copy() {
+  local source_dir="$1" target_dir="$2"
+  local include_file="$source_dir/$WORKTREE_INCLUDE"
+  [[ -f "$include_file" ]] || return 0
+
+  local copied=0 rel source_path target_path target_parent check_parent
+  local unsafe_parent
+  while IFS= read -r -d '' rel; do
+    source_path="$source_dir/$rel"
+    target_path="$target_dir/$rel"
+
+    if [[ ! -f "$source_path" && ! -L "$source_path" ]]; then
+      warn "Skipping '$rel' from $WORKTREE_INCLUDE: unsupported file type."
+      continue
+    fi
+
+    # ls-files --others already excludes tracked source files. Check the
+    # target too because its branch may track a path that the source does not.
+    if git -C "$target_dir" ls-files --error-unmatch -- "$rel" &>/dev/null; then
+      continue
+    fi
+    if [[ -e "$target_path" || -L "$target_path" ]]; then
+      warn "Skipping '$rel' from $WORKTREE_INCLUDE: target already exists."
+      continue
+    fi
+
+    # Do not follow a target-side parent symlink outside the new worktree.
+    target_parent="$(dirname "$target_path")"
+    check_parent="$target_parent"
+    unsafe_parent=false
+    while [[ "$check_parent" != "$target_dir" ]]; do
+      if [[ -L "$check_parent" ]]; then
+        unsafe_parent=true
+        break
+      fi
+      local next_parent
+      next_parent="$(dirname "$check_parent")"
+      if [[ "$next_parent" == "$check_parent" ]]; then
+        unsafe_parent=true
+        break
+      fi
+      check_parent="$next_parent"
+    done
+    if $unsafe_parent; then
+      warn "Skipping '$rel' from $WORKTREE_INCLUDE: target parent is a symlink."
+      continue
+    fi
+
+    mkdir -p "$target_parent" || {
+      _err "Could not create target directory for '$rel'."
+      return 1
+    }
+    cp -Pp "$source_path" "$target_path" || {
+      _err "Could not copy '$rel' from $WORKTREE_INCLUDE."
+      return 1
+    }
+    ((copied++)) || true
+  done < <(
+    git -C "$source_dir" ls-files --others --ignored \
+      --exclude-from="$include_file" -z 2>/dev/null \
+      | git -C "$source_dir" check-ignore --stdin -z 2>/dev/null \
+      || true
+  )
+
+  if [[ $copied -gt 0 ]]; then
+    info "Copied ${copied} ignored path(s) from ${BOLD}${WORKTREE_INCLUDE}${RESET}"
+  fi
 }
 
 # ─── Dependency checks ───────────────────────────────────────────────────────
@@ -1642,12 +1764,23 @@ cmd_create() {
 
   echo -e "Creating worktree ${BOLD}${WORKTREE_NAME}${RESET} from ${CYAN}${from_ref}${RESET}..."
 
+  # Resolve the source before adding the target; otherwise a repo with no
+  # existing worktrees could select the new target as its own source.
+  local include_source=""
+  include_source="$(_worktreeinclude_source "$PARENT_DIR" "$from_ref")" || true
+
   (cd "$PARENT_DIR" && git worktree add "$WORKTREE_NAME" -b "$WORKTREE_NAME" "$from_ref" --quiet) ||
     die "Failed to create worktree. Does the branch '$WORKTREE_NAME' already exist?"
 
   # Set upstream if the base was a remote branch
   if git -C "$PROJECT_DIR" rev-parse --verify "refs/remotes/origin/$from_ref" &>/dev/null; then
     git -C "$PROJECT_DIR" branch --set-upstream-to="origin/$from_ref" "$WORKTREE_NAME" --quiet 2>/dev/null || true
+  fi
+
+  if [[ -n "$include_source" ]] && ! _worktreeinclude_copy "$include_source" "$PROJECT_DIR"; then
+    git -C "$PARENT_DIR" worktree remove --force "$PROJECT_DIR" 2>/dev/null || true
+    git -C "$PARENT_DIR" branch -D "$WORKTREE_NAME" &>/dev/null || true
+    die "Failed to populate worktree from $WORKTREE_INCLUDE; creation was rolled back."
   fi
 
   info "Created worktree ${BOLD}${WORKTREE_NAME}${RESET} → branch ${CYAN}${WORKTREE_NAME}${RESET}"
@@ -1821,6 +1954,12 @@ cmd_fork() {
   upstream="$(git -C "$source_dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)" || true
   if [[ -n "$upstream" ]]; then
     git -C "$target_dir" branch --set-upstream-to="$upstream" "$target_name" --quiet 2>/dev/null || true
+  fi
+
+  if ! _worktreeinclude_copy "$source_dir" "$target_dir"; then
+    git -C "$PARENT_DIR" worktree remove --force "$target_dir" 2>/dev/null || true
+    git -C "$PARENT_DIR" branch -D "$target_name" &>/dev/null || true
+    die "Failed to populate worktree from $WORKTREE_INCLUDE; fork was rolled back."
   fi
 
   # Record the source branch so `zproj update` can find it later.
@@ -2903,6 +3042,8 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME create <worktree-dir> [--from <ref>]
 
   Create a new worktree. The branch name matches the directory name.
   Base ref defaults to the remote HEAD (usually origin/main).
+  If the source worktree contains $WORKTREE_INCLUDE, matching gitignored
+  files and directories are copied into the new worktree.
 
 EOF
 }
@@ -2931,8 +3072,9 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME fork <new-worktree>
   With one argument, the source is the current worktree (CWD).
   With two arguments, the first is the source worktree name.
 
-  Only committed state is forked. If the source has uncommitted changes,
-  a warning is printed but the fork proceeds with committed state only.
+  Committed state is forked. If the source has uncommitted changes, a warning
+  is printed and those changes are not forked. Gitignored paths selected by
+  $WORKTREE_INCLUDE are copied separately.
 
 ${BOLD}Examples:${RESET}
   $SCRIPT_NAME fork experiment     ${DIM}# fork CWD worktree → experiment${RESET}
@@ -5655,6 +5797,41 @@ NOTES
   _t_grep "T6: feature-x branch created" "feature-x" \
     git -C "$lt_root" branch
 
+  _section "WI1 — create: copies only ignored .worktreeinclude matches"
+
+  local wi_root="$tmp/wi"
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init wi &>/dev/null ) || true
+  git -C "$wi_root/main" config user.name "Test" || true
+  git -C "$wi_root/main" config user.email "t@t.test" || true
+  printf '.env\ncache/\nconfig/\n' > "$wi_root/main/.gitignore"
+  printf '.env\ncache/*\n!cache/skip.tmp\nconfig/\nlocal.txt\ntracked.txt\n' \
+    > "$wi_root/main/.worktreeinclude"
+  printf 'tracked\n' > "$wi_root/main/tracked.txt"
+  git -C "$wi_root/main" add .gitignore .worktreeinclude tracked.txt
+  git -C "$wi_root/main" commit -q -m "configure worktree includes" || true
+
+  mkdir -p "$wi_root/main/cache" "$wi_root/main/config/nested"
+  printf 'secret\n' > "$wi_root/main/.env"
+  printf 'keep\n' > "$wi_root/main/cache/a b.keep"
+  printf 'skip\n' > "$wi_root/main/cache/skip.tmp"
+  printf 'nested\n' > "$wi_root/main/config/nested/secret.json"
+  printf 'not ignored\n' > "$wi_root/main/local.txt"
+
+  local wi1_out
+  wi1_out="$(cd "$wi_root" && "$BASH" "$_ZPROJ_SELF" create feature 2>&1)" || true
+  _t_grep  "WI1: reports copied ignored paths" "Copied 3 ignored path(s)" echo "$wi1_out"
+  _t_check "WI1: copies included ignored file" test -f "$wi_root/feature/.env"
+  _t_check "WI1: preserves paths containing spaces" test -f "$wi_root/feature/cache/a b.keep"
+  _t_check "WI1: copies included directory contents" test -f "$wi_root/feature/config/nested/secret.json"
+  _t_check "WI1: honors negated include pattern" test ! -e "$wi_root/feature/cache/skip.tmp"
+  _t_check "WI1: does not copy non-ignored match" test ! -e "$wi_root/feature/local.txt"
+  _t_grep  "WI1: tracked path comes from checkout" "tracked" cat "$wi_root/feature/tracked.txt"
+
+  _section "WI2 — create: uses the --from worktree as include source"
+  printf 'feature secret\n' > "$wi_root/feature/.env"
+  ( cd "$wi_root" && "$BASH" "$_ZPROJ_SELF" create from-feature --from feature &>/dev/null ) || true
+  _t_grep "WI2: copied source-specific value" "feature secret" cat "$wi_root/from-feature/.env"
+
   _section "T7 — delete: removes worktree and branch"
 
   # cmd_delete checks for tmux window; session doesn't exist so it skips that
@@ -6750,6 +6927,17 @@ NOTES
   _t_check "FK3: dirty.txt not in fork"       test ! -f "$fk_root/dirty-fork/dirty.txt"
   rm -f "$fk_root/main/dirty.txt"
 
+  _section "FK7 — fork: copies .worktreeinclude paths from source"
+  printf '.local-env\n' > "$fk_root/main/.gitignore"
+  printf '.local-env\n' > "$fk_root/main/.worktreeinclude"
+  git -C "$fk_root/main" add .gitignore .worktreeinclude
+  git -C "$fk_root/main" commit -q -m "configure worktree includes" || true
+  printf 'fork secret\n' > "$fk_root/main/.local-env"
+  local fk7_include_exit
+  fk7_include_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork main included-fork &>/dev/null); echo $? )"
+  _t_check "FK7: exits 0"                      test "$fk7_include_exit" -eq 0
+  _t_grep  "FK7: copied ignored source file"   "fork secret" cat "$fk_root/included-fork/.local-env"
+
   _section "FK4 — fork: target already exists → error"
   local fk4_exit
   fk4_exit="$( (cd "$fk_root/main" && "$BASH" "$_ZPROJ_SELF" fork experiment &>/dev/null); echo $? )"
@@ -6770,6 +6958,7 @@ NOTES
   ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete experiment --force &>/dev/null ) || true
   ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete from-main --force &>/dev/null ) || true
   ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete dirty-fork --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete included-fork --force &>/dev/null ) || true
 
   # ── Section: FJ — join ──────────────────────────────────────────────────
 
