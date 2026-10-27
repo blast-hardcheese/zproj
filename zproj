@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.1"
+readonly VERSION="4.18.2"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -232,8 +232,7 @@ _git_is_dirty() {
 }
 
 # Warn if the worktree at $1 has a branch checked out whose name does not
-# match the worktree's directory name. zproj's whole model assumes the
-# invariant `basename(<worktree>) == checked-out branch name`; when a user
+# match its path relative to the project root. When a user
 # manually checks out a different branch, operations like `zproj update`
 # silently target the wrong branch.
 #
@@ -241,8 +240,11 @@ _git_is_dirty() {
 # fire constantly during legitimate bisects). Returns 0 always.
 _warn_branch_mismatch() {
   local wt_dir="$1"
-  local dir_name actual_branch
-  dir_name="$(basename "$wt_dir")"
+  local dir_name actual_branch repo_root
+  wt_dir="$(cd "$wt_dir" 2>/dev/null && pwd -P)" || return 0
+  repo_root="$(git -C "$wt_dir" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  repo_root="$(dirname "$repo_root")"
+  dir_name="${wt_dir#"$repo_root/"}"
   actual_branch="$(git -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 0
   [[ -z "$actual_branch" ]] && return 0
   [[ "$actual_branch" == "HEAD" ]] && return 0
@@ -908,7 +910,7 @@ cmd_env() {
 # ─── Directory resolution ────────────────────────────────────────────────────
 
 # Given a user argument (relative name or path), resolve to an absolute path
-# and validate the parent contains .bare.
+# and find the containing bare worktree root.
 #
 # Returns via globals: PROJECT_DIR, PARENT_DIR, WORKTREE_NAME, SESSION_NAME, WINDOW_NAME
 resolve_project_dir() {
@@ -922,17 +924,24 @@ resolve_project_dir() {
     resolved="$(pwd)/$arg"
   fi
 
-  # Clean up trailing slashes and normalize
-  resolved="$(cd "$(dirname "$resolved")" 2>/dev/null && echo "$(pwd)/$(basename "$resolved")")" ||
-    die "Parent directory of '$arg' does not exist."
+  # Clean up trailing slashes and normalize existing parent directories.
+  while [[ "$resolved" != "/" && "$resolved" == */ ]]; do
+    resolved="${resolved%/}"
+  done
+  if [[ -d "$(dirname "$resolved")" ]]; then
+    resolved="$(cd "$(dirname "$resolved")" && echo "$(pwd -P)/$(basename "$resolved")")"
+  fi
 
   PROJECT_DIR="$resolved"
   PARENT_DIR="$(dirname "$resolved")"
-  WORKTREE_NAME="$(basename "$resolved")"
+  while [[ "$PARENT_DIR" != "/" && ! -d "$PARENT_DIR/$BARE_DIR" ]]; do
+    PARENT_DIR="$(dirname "$PARENT_DIR")"
+  done
+  WORKTREE_NAME="${resolved#"$PARENT_DIR/"}"
 
   # Validate bare repo structure in parent
   if [[ ! -d "$PARENT_DIR/$BARE_DIR" ]]; then
-    echo -e "${RED}error:${RESET} '${PARENT_DIR}' is not a bare worktree root." >&2
+    echo -e "${RED}error:${RESET} No bare worktree root found for '$arg'." >&2
     echo "" >&2
     echo -e "  Expected structure:" >&2
     echo -e "    ${BOLD}$(basename "$PARENT_DIR")/${RESET}" >&2
@@ -2496,10 +2505,10 @@ cmd_list() {
   # Find the bare repo root
   local root
   if [[ -n "$target_dir" ]]; then
-    root="$(cd "$target_dir" 2>/dev/null && pwd)" ||
+    root="$(cd "$target_dir" 2>/dev/null && pwd -P)" ||
       die "Directory '$target_dir' does not exist."
   else
-    root="$(pwd)"
+    root="$(pwd -P)"
   fi
 
   # Walk up to find .bare if we're inside a worktree
@@ -2546,7 +2555,7 @@ cmd_list() {
     # Called when a complete porcelain stanza has been accumulated
     [[ "$_wt_branch" == "(bare)" ]] && return
     local _name _dirty _window_status
-    _name="$(basename "$_wt_path")"
+    _name="${_wt_path#"$root/"}"
     _dirty="clean"; _git_is_dirty "$_wt_path" && _dirty="dirty"
     _window_status="none"
     local _win_entry
@@ -2630,7 +2639,7 @@ cmd_list() {
 
 cmd_open() {
   local root
-  root="$(pwd)"
+  root="$(pwd -P)"
 
   if [[ ! -d "$root/$BARE_DIR" ]]; then
     echo -e "${RED}error:${RESET} Not in a bare worktree root." >&2
@@ -2670,14 +2679,14 @@ cmd_open() {
     elif [[ "$_line" == "detached" ]];   then _op_branch=""
     elif [[ -z "$_line" && -n "$_op_path" ]]; then
       if [[ "$_op_branch" != "(bare)" && -d "$_op_path" ]]; then
-        all_wts+=("$(basename "$_op_path")")
+        all_wts+=("${_op_path#"$root/"}")
       fi
       _op_path="" _op_branch=""
     fi
   done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
   # Handle last entry (porcelain output may not end with a blank line)
   if [[ -n "$_op_path" && "$_op_branch" != "(bare)" && -d "$_op_path" ]]; then
-    all_wts+=("$(basename "$_op_path")")
+    all_wts+=("${_op_path#"$root/"}")
   fi
 
   if [[ ${#all_wts[@]} -eq 0 ]]; then
@@ -2821,6 +2830,7 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Directory resolution:${RESET}
   From the bare repo root:   $SCRIPT_NAME feature-auth
+  Slash-named branch:        $SCRIPT_NAME feat/my-feature
   From anywhere:             $SCRIPT_NAME ~/projects/zio-blocks/feature-auth
   Project root as shortcut:  $SCRIPT_NAME zio-blocks   ${DIM}# opens session (same as: cd zio-blocks; zproj)${RESET}
 
@@ -3131,13 +3141,11 @@ _resolve_pane_target() {
 }
 
 # Walk up from cwd to find the bare repo root and the worktree root.
-# The worktree root is the direct child of the bare repo parent that contains
-# the .bare dir — i.e. the directory one level below the project root that
-# is a registered worktree.  Correctly handles cwd being a nested subdirectory.
+# The worktree root is a registered worktree below the bare repo parent.
 #
 # On success sets:
 #   _REVIEW_REPO_ROOT   — the project root (contains .bare/)
-#   _REVIEW_WT_ROOT     — the worktree root (direct child of _REVIEW_REPO_ROOT)
+#   _REVIEW_WT_ROOT     — the registered worktree root
 # Returns 0 on success, 1 if not inside a zproj worktree.
 _review_locate() {
   local dir
@@ -3156,23 +3164,15 @@ _review_locate() {
 
   _REVIEW_REPO_ROOT="$root"
 
-  # The worktree root is the component of $dir that is a direct child of $root.
-  # Walk from $root down the path towards $dir; the first step is the WT root.
-  local rel="${dir#"$root/"}"         # e.g. "main/src/module"
-  local wt_name="${rel%%/*}"          # first path component, e.g. "main"
-  if [[ -z "$wt_name" ]]; then
-    # cwd IS the repo root — not inside any worktree
-    return 1
-  fi
-  _REVIEW_WT_ROOT="$root/$wt_name"
-
-  # Verify the derived path is actually a registered worktree, not just any
-  # sibling directory that happens to sit under the bare repo root.
-  if ! _git_is_registered_worktree "$root" "$_REVIEW_WT_ROOT"; then
-    return 1
-  fi
-
-  return 0
+  local candidate="$dir"
+  while [[ "$candidate" != "$root" ]]; do
+    if _git_is_registered_worktree "$root" "$candidate"; then
+      _REVIEW_WT_ROOT="$candidate"
+      return 0
+    fi
+    candidate="$(dirname "$candidate")"
+  done
+  return 1
 }
 
 # Return the review notes path.
@@ -3201,7 +3201,7 @@ _review_find_session() {
   fi
 
   SESSION_NAME="$(_tmux_session_name "$(basename "$_REVIEW_REPO_ROOT")")"
-  WINDOW_NAME="$(basename "$_REVIEW_WT_ROOT")"
+  WINDOW_NAME="${_REVIEW_WT_ROOT#"$_REVIEW_REPO_ROOT/"}"
   return 0
 }
 
@@ -5107,6 +5107,18 @@ STUB
   _t_grep  "clear error message"  "detached HEAD"  _zproj init u10
   _t_check ".git dir intact"      test -d "$tmp/u10/.git"
 
+  _section "U11 — upgrade: slash-named HEAD keeps nested worktree usable"
+  _make_repo u11
+  git -C "$tmp/u11" checkout -q -b feat/deep
+  echo "local" > "$tmp/u11/local.txt"
+  _zproj init u11 &>/dev/null
+  _t_check "U11: nested worktree created" test -d "$tmp/u11/feat/deep"
+  _t_check "U11: local file preserved" test -f "$tmp/u11/feat/deep/local.txt"
+  _t_check "U11: branch remains feat/deep" \
+    bash -c '[[ "$(git -C "$1" branch --show-current)" == "feat/deep" ]]' -- "$tmp/u11/feat/deep"
+  _t_check "U11: nested worktree registered" \
+    _git_is_registered_worktree "$tmp/u11" "$tmp/u11/feat/deep"
+
   # ── Section: _resolve_editor ──────────────────────────────────────────────
   # E1–E6 require nvim and code binaries in PATH. Skip gracefully if absent.
 
@@ -6071,6 +6083,50 @@ NOTES
     _tmux has-session -t "b11proj"
   _tmux kill-session -t "b11proj" 2>/dev/null || true
   rm -rf "$b11_parent" || true
+
+  _section "B12 — nested branch worktree resolves from path and cwd"
+  local b12_root="$tmp/b12"
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init b12 --main feat/deep &>/dev/null ) || true
+  local b12_wt="$b12_root/feat/deep"
+  _t_check "B12: nested worktree created" test -d "$b12_wt"
+  _t_check "B12: nested worktree registered" _git_is_registered_worktree "$b12_root" "$b12_wt"
+  local b12_resolved=""
+  b12_resolved="$(resolve_project_dir "$b12_wt/" && echo "$PARENT_DIR|$WORKTREE_NAME")" || true
+  _t_check "B12: path resolves to bare root and full name" \
+    test "$b12_resolved" = "$(cd "$b12_root" && pwd -P)|feat/deep"
+  local b12_review=""
+  b12_review="$(cd "$b12_wt" && "$BASH" "$_ZPROJ_SELF" review path --abs 2>/dev/null)" || true
+  _t_check "B12: review finds nested worktree" test "$b12_review" = "$b12_wt/$REVIEW_NOTES_RELPATH"
+  local b12_session=""
+  b12_session="$(cd "$b12_wt" && _review_find_session && echo "$SESSION_NAME|$WINDOW_NAME")" || true
+  _t_check "B12: review targets nested window" test "$b12_session" = "b12|feat/deep"
+  local b12_list=""
+  b12_list="$(cd "$b12_root" && "$BASH" "$_ZPROJ_SELF" list 2>/dev/null)" || true
+  _t_check "B12: list shows full nested name" bash -c '[[ "$1" == *"feat/deep"* ]]' -- "$b12_list"
+  local b12_create_exit=0
+  ( cd "$b12_root" && "$BASH" "$_ZPROJ_SELF" create feat/next &>/dev/null ) || b12_create_exit=$?
+  _t_check "B12: create accepts nested branch name" test "$b12_create_exit" -eq 0
+  _t_check "B12: created nested branch matches worktree" \
+    bash -c '[[ "$(git -C "$1" branch --show-current)" == "feat/next" ]]' -- "$b12_root/feat/next"
+  if command -v tmux &>/dev/null; then
+    local b12_launch_exit=0
+    ( ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" "$b12_wt/" &>/dev/null ) || b12_launch_exit=$?
+    _t_check "B12: default action opens nested worktree" test "$b12_launch_exit" -eq 0
+    _t_grep "B12: nested window uses full branch name" '^feat/deep$' \
+      _tmux list-windows -t b12 -F '#{window_name}'
+    _tmux kill-session -t b12 2>/dev/null || true
+    local b12_open_exit=0
+    ( cd "$b12_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" &>/dev/null ) || b12_open_exit=$?
+    _t_check "B12: project open launches nested worktrees" test "$b12_open_exit" -eq 0
+    _t_grep "B12: project session contains nested window" '^feat/deep$' \
+      _tmux list-windows -t b12 -F '#{window_name}'
+    _tmux kill-session -t b12 2>/dev/null || true
+  fi
+  local b12_delete_exit=0
+  ( cd "$b12_root" && "$BASH" "$_ZPROJ_SELF" delete feat/next &>/dev/null ) || b12_delete_exit=$?
+  _t_check "B12: delete accepts nested worktree" test "$b12_delete_exit" -eq 0
+  _t_check "B12: nested branch removed" \
+    bash -c '! git -C "$1" show-ref --verify --quiet refs/heads/feat/next' -- "$b12_root"
 
   # ── Section: TM — tmux session name sanitisation ─────────────────────────
   # Bug: '.' and ':' in a project directory name are tmux target-syntax
