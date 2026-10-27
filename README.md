@@ -261,8 +261,8 @@ The notes file is deleted after the temp file is safely written.
 ## Machine integration
 
 `zproj integrate` bootstraps a new machine in one step. **Re-running it is safe:**
-worktree keybindings and desktop-notification hooks are rewritten from a clean
-slate (no duplicate `bind` lines or stacked `set-hook` entries in `tmux.conf`).
+worktree keybindings are refreshed, legacy notification hooks are removed,
+and bell monitoring settings are added only when missing.
 
 1. **Installs tmux keybindings** for worktree management (create, delete,
    fork, join, update) into your tmux config
@@ -277,26 +277,16 @@ zproj integrate --plan       # dry run: show what would be done
 
 ## Notifications
 
-`zproj integrate` configures a three-layer notification pipeline so that when
-any coding agent finishes working in a tmux pane, you get a desktop
-notification with worktree context.
+`zproj integrate` configures agents to emit terminal bells when they need
+attention and enables tmux bell monitoring.
 
 **Agent layer**: configures each installed agent to emit BEL on idle (claude,
-aider, codex, gemini). Agents without a notification API (amp, goose, hermes,
-agent) use a `monitor-silence` fallback.
+aider, codex, gemini). Agents without a terminal notification API are left
+unconfigured rather than treating every quiet pane as needing attention.
 
-**tmux layer**: installs `alert-bell` and `alert-silence` hooks that call
-`zproj notify`. Installs use **`set-hook -g`** (replace one handler) so each
-`tmux source-file …` does **not** multiply copies. **`zproj integrate`** also
-rewrites any older **`-ga`** notifier lines in your tmux conf to **`-g`** so
-reloads stop stacking handlers. If your **server** already has a long stacked
-chain from previous reloads, reset once, then reload:
-
-```bash
-tmux set-hook -ug alert-bell
-tmux set-hook -ug alert-silence
-tmux source-file ~/.config/tmux/tmux.conf   # or ~/.tmux.conf
-```
+**tmux layer**: enables `monitor-bell` so only explicit agent alerts mark a
+window as needing attention. It does not install alert hooks or enable
+`monitor-silence`.
 
 **Terminal layer**: add these to `~/.config/ghostty/config` for rich desktop
 notifications (not auto-configured):
@@ -307,13 +297,9 @@ bell-features = title,attention,audio
 bell-audio-path = /System/Library/Sounds/Glass.aiff
 ```
 
-tmux 3.3+ delivers full OSC 777 desktop notifications. tmux 3.0–3.2 delivers
-bell forwarding only (dock bounce + audio still work via `bell-features`).
-If a session or window name contains a semicolon, `zproj notify` rewrites it before
-emitting OSC 777 so the terminal does not mis-parse the sequence (which would
-otherwise show as junk in apps like Neovim until you redraw).
-
-Set `$ZPROJ_NOTIFY_COOLDOWN` to override the 5-second per-pane debounce.
+The legacy `zproj notify` command is a no-op. This avoids writing OSC control
+sequences directly to client TTYs while an interactive application owns the
+pane.
 
 ## Command reference
 
@@ -334,7 +320,7 @@ zproj --sandbox [--plan] launch <worktree-dir>
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
 zproj integrate [--plan]                    tmux bindings + editor integration
-zproj notify [session] [window] [pane]      Emit desktop notification (used by tmux hooks)
+zproj notify [session] [window] [pane]      Legacy no-op for old tmux hooks
 zproj --env                                 Show resolved editor and coding agent
 zproj --diagnostics                         Check environment for problems
 zproj --test                                Run the built-in test suite
