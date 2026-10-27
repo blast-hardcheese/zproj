@@ -12,9 +12,9 @@
 **Parallel workspaces with bare git worktrees and tmux.**
 
 Manage parallel feature branches as first-class workspaces. Each branch gets
-its own directory and a tmux window with a 3-pane layout — coding agent,
-editor, and shell — all opened in the right place automatically. Worktrees,
-branches, and windows are created and torn down together as a unit.
+its own directory and a tmux window with a 2-pane layout — coding agent and
+shell — both opened in the right place automatically. Worktrees, branches,
+and windows are created and torn down together as a unit.
 
 A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
@@ -132,23 +132,19 @@ explicit source. Existing target paths are never overwritten.
 ### Tmux layout
 
 One tmux **session** per project, one **window** per worktree. Each window has
-three panes, all opened in the worktree directory:
+two panes, both opened in the worktree directory:
 
 ```
-┌─────────────────┬──────────────────┐
-│                 │                  │
-│  coding agent   │     editor       │
-│  (pane 1)       │     (pane 2)     │
-│                 ├──────────────────┤
-│                 │                  │
-│                 │     shell        │
-│                 │     (pane 3)     │
-└─────────────────┴──────────────────┘
+┌─────────────────┬─────────────────┐
+│                 │                 │
+│  coding agent   │      shell      │
+│  (pane 1)       │    (pane 2)     │
+│                 │                 │
+└─────────────────┴─────────────────┘
 ```
 
-Panes are named after the tool they run (e.g. `opencode`, `nvim`, `shell`)
-so dispatch commands always reach the right pane regardless of which window
-is active.
+Panes are named after the tool they run (e.g. `opencode`, `shell`) so dispatch
+commands always reach the right pane regardless of which window is active.
 
 ### Tmux keybindings
 

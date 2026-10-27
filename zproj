@@ -520,7 +520,7 @@ _is_gui_editor() {
   return 1
 }
 
-# Resolve the editor command to use in pane 2.
+# Resolve the editor command to target during editor integration.
 # Resolution order: $ZPROJ_EDITOR → $EDITOR → nvim → vim → die
 # Prints the resolved command string to stdout.
 _resolve_editor() {
@@ -537,8 +537,7 @@ _resolve_editor() {
     if command -v "$binary" &>/dev/null; then
       # Warn if it looks like a GUI editor
       if _is_gui_editor "$binary"; then
-        warn "Editor '${binary}' is a GUI application and may not work well in a tmux pane."
-        warn "Set ZPROJ_EDITOR=nvim (or another terminal editor) to override."
+        warn "Editor '${binary}' is a GUI application; editor integration may require manual setup."
       fi
       echo "$cmd"
       return 0
@@ -926,10 +925,9 @@ cmd_env() {
   local editor_src
   editor_src="$(_resolve_editor_source "${editor%% *}")"
 
-  echo -e "  ${BOLD}Editor${RESET}  (pane 2): ${CYAN}${editor}${RESET}  ${DIM}[${editor_src}]${RESET}"
+  echo -e "  ${BOLD}Editor${RESET}  (integration): ${CYAN}${editor}${RESET}  ${DIM}[${editor_src}]${RESET}"
   if _is_gui_editor "${editor%% *}" 2>/dev/null; then
-    echo -e "  ${YELLOW}warn:${RESET}  '${editor%% *}' is a GUI application and may not work well in a tmux pane."
-    echo -e "         Set ${CYAN}ZPROJ_EDITOR=nvim${RESET} (or another terminal editor) to override."
+    echo -e "  ${YELLOW}warn:${RESET}  '${editor%% *}' is a GUI application; editor integration may require manual setup."
   fi
 
   # AI source
@@ -2461,12 +2459,10 @@ cmd_launch() {
 
   _warn_branch_mismatch "$PROJECT_DIR"
 
-  # Resolve editor and AI agent (host vs Lima guest).
-  local editor ai
+  # Resolve AI agent (host vs Lima guest).
+  local ai
   local instance="" yaml=""
   local guest_dir=""
-
-  editor="$(_resolve_editor)"
 
   if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
     instance="$(_lima_instance_name "$PARENT_DIR")"
@@ -2488,14 +2484,13 @@ cmd_launch() {
     ai="$(_resolve_ai "$PROJECT_DIR")"
   fi
 
-  # Derive pane names from the binary names
-  local ai_pane_name editor_pane_name
+  # Derive pane name from the binary name
+  local ai_pane_name
   ai_pane_name="${ai%% *}"          # first word of ai command, or empty
   [[ -z "$ai_pane_name" ]] && ai_pane_name="shell"
-  editor_pane_name="${editor%% *}"  # first word of editor command
 
   # Build pane commands — quote the directory to handle spaces in paths.
-  local ai_cmd editor_cmd
+  local ai_cmd
   local quoted_dir
   printf -v quoted_dir '%q' "$PROJECT_DIR"
   if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
@@ -2505,26 +2500,21 @@ cmd_launch() {
   else
     ai_cmd="cd $quoted_dir"   # no agent: just a shell in the left pane
   fi
-  editor_cmd="cd $quoted_dir && $editor ."
-  # Helper: create the 3-pane layout in the current window.
+
+  # Helper: create the 2-pane layout in the current window.
   # Captures pane IDs at creation time (not indices) so this works
   # regardless of the user's pane-base-index tmux setting.
   _setup_panes() {
-    local _p1 _p2 _p3
+    local _p1 _p2
     # Pane 1: the initial pane already exists after new-session/new-window
     _p1="$(_tmux list-panes -t "$SESSION_NAME:$WINDOW_NAME" -F '#{pane_id}' | head -1)"
     _tmux send-keys   -t "$_p1" "$ai_cmd" Enter
     _tmux select-pane -t "$_p1" -T "$ai_pane_name"
 
-    # Pane 2: horizontal split
+    # Pane 2: shell
     _p2="$(_tmux split-window -t "$SESSION_NAME:$WINDOW_NAME" -h \
              -c "$PROJECT_DIR" -P -F '#{pane_id}')"
-    _tmux send-keys   -t "$_p2" "$editor_cmd" Enter
-    _tmux select-pane -t "$_p2" -T "$editor_pane_name"
-
-    # Pane 3: vertical split of pane 2
-    _p3="$(_tmux split-window -t "$_p2" -v -c "$PROJECT_DIR" -P -F '#{pane_id}')"
-    _tmux select-pane -t "$_p3" -T "shell"
+    _tmux select-pane -t "$_p2" -T "shell"
 
     # Focus the agent pane
     _tmux select-pane -t "$_p1"
@@ -2872,8 +2862,8 @@ ${BOLD}╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═══�
 ${BOLD}${SCRIPT_NAME}${RESET} — parallel workspaces with bare git worktrees and tmux
 
   Manage parallel feature branches as first-class workspaces. Each branch
-  gets its own directory and a tmux window with a 3-pane layout — coding
-  agent, editor, and shell — all opened in the right place automatically.
+  gets its own directory and a tmux window with a 2-pane layout — coding
+  agent and shell — both opened in the right place automatically.
   Worktrees, branches, and windows are created and torn down together as a
   unit. A built-in review workflow lets you annotate lines during a diff
   review and dispatch the collected notes to the coding agent for
@@ -2908,7 +2898,7 @@ ${BOLD}Directory resolution:${RESET}
 ${BOLD}Tmux layout:${RESET}
   One session per project (e.g. zio-blocks).
   One window per worktree (e.g. main, feature-auth, fix-schema).
-  Each window: coding agent (left) + editor (right-top) + shell (right-bottom).
+  Each window: coding agent (left) + shell (right).
   Run ${CYAN}$SCRIPT_NAME --env${RESET} to see which tools will be used.
 
 ${BOLD}Examples:${RESET}
@@ -3099,12 +3089,11 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME launch <worktree-dir>
   Creates the project session if it doesn't exist yet.
 
   ${BOLD}Layout:${RESET}
-    Pane 1 (left):         Coding agent  (\$CODING_AGENT → auto-discover → shell)
-    Pane 2 (right-top):    Editor        (\$ZPROJ_EDITOR → \$EDITOR → nvim → vim)
-    Pane 3 (right-bottom): Shell
+    Pane 1 (left):  Coding agent  (\$CODING_AGENT → auto-discover → shell)
+    Pane 2 (right): Shell
 
   ${BOLD}Tool resolution:${RESET}
-    Run ${CYAN}$SCRIPT_NAME --env${RESET} to see which editor and agent will be used.
+    Run ${CYAN}$SCRIPT_NAME --env${RESET} to see the resolved editor and agent.
 
   ${BOLD}Auto-discovered agents (in order):${RESET}
     opencode, claude, codex, amp, aider, goose, gemini, pi, hermes, agent (Cursor)
@@ -3125,8 +3114,8 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME launch <worktree-dir>
     Requires ${CYAN}limactl${RESET}; ${CYAN}--plan${RESET} prints instance + mounts without touching the VM/tmux.
     Global ${CYAN}--sandbox${RESET}/${CYAN}--plan${RESET} may appear in either order before the subcommand.
 
-  ${BOLD}Note:${RESET} GUI editors (code, zed, cursor, etc.) will trigger a warning —
-    they may not behave well inside a tmux pane.
+  ${BOLD}Note:${RESET} The editor is resolved for ${CYAN}$SCRIPT_NAME integrate${RESET}; launch does not
+    start a dedicated editor pane.
 
 EOF
 }
@@ -3532,7 +3521,7 @@ cmd_diagnostics() {
   fi
 
   # ── Section: Editor ─────────────────────────────────────────────────────
-  _section_header "Editor  (pane 2)"
+  _section_header "Editor  (integration target)"
 
   local editor editor_binary editor_src
   editor="$(_resolve_editor 2>/dev/null)" || editor=""
@@ -3546,10 +3535,9 @@ cmd_diagnostics() {
     editor_src="$(_resolve_editor_source "$editor_binary")"
 
     if _is_gui_editor "$editor_binary"; then
-      _diag_warn "$editor" "GUI app — will not work in a tmux pane  [${editor_src}]"
-      _diag_warn "" "  set ZPROJ_EDITOR=nvim (or another terminal editor)"
+      _diag_warn "$editor" "GUI app — editor integration may require manual setup  [${editor_src}]"
     elif [[ "$editor_binary" == ":" ]]; then
-      _diag_warn ":" "bash no-op — editor pane will exit immediately  [${editor_src}]"
+      _diag_warn ":" "bash no-op — editor integration is unavailable  [${editor_src}]"
     else
       _diag_ok "$editor" "$(command -v "$editor_binary" 2>/dev/null)  [${editor_src}]"
     fi
@@ -3930,13 +3918,12 @@ This ensures the path stays correct regardless of which worktree is active.
 ${SCRIPT_NAME} is a workflow manager that combines:
 - **Bare git worktrees** — each feature/branch gets its own directory
 - **tmux sessions** — one session per project, one window per worktree
-- **3-pane tmux layout** per window:
+- **2-pane tmux layout** per window:
   - Pane 1 (left): coding agent (named after its binary, e.g. \`opencode\`)
-  - Pane 2 (right-top): editor (named after its binary, e.g. \`nvim\`)
-  - Pane 3 (right-bottom): shell
+  - Pane 2 (right): shell
 
-The user opens a project with \`${SCRIPT_NAME} launch <worktree>\` and gets all three
-tools in one window, already positioned in the worktree directory.
+The user opens a project with \`zproj launch <worktree>\` and gets both panes
+in one window, already positioned in the worktree directory.
 
 - **tmux keybindings** for worktree management (create, delete, fork, join, update)
 are installed automatically by \`${SCRIPT_NAME} integrate\` — no editor-side action needed.
@@ -4608,6 +4595,9 @@ EOF
 # ─── Self-test ───────────────────────────────────────────────────────────────
 
 cmd_test() {
+  # Fake HOME directories must not resolve the host XDG tmux configuration.
+  local XDG_CONFIG_HOME=""
+  export XDG_CONFIG_HOME
   local tmp
   tmp="$(mktemp -d)"
 
@@ -5453,15 +5443,15 @@ NOTES
   # TMUX_TEST_SESSION is exported so helper functions can reference it.
   local TMUX_TEST_SESSION="zproj-test-$$"
 
-  # ── T1-T4: cmd_launch — named panes ──────────────────────────────────────
+  # ── T1-T3: cmd_launch — named panes ──────────────────────────────────────
   # We test _setup_panes directly rather than going through cmd_launch, because
-  # cmd_launch sends real editor/agent binaries that exit immediately in a
-  # headless pane (no terminal, no project) and destroy the window before we
+  # cmd_launch sends a real agent binary that exits immediately in a headless
+  # pane (no terminal, no project) and destroys the window before we
   # can inspect it. The naming logic is entirely in _setup_panes; cmd_launch's
   # job of resolving tools and building the session is tested via the other
   # integration paths.
 
-  _section "T1-T4 — launch: 3-pane window with named panes"
+  _section "T1-T3 — launch: 2-pane window with named panes"
 
   # Shared bare worktree used by T1-T8.
   # Use zproj init (tests the fixed bootstrap) rather than manual setup.
@@ -5469,10 +5459,8 @@ NOTES
   rm -rf "$lt_root" || true
   ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init lt &>/dev/null ) || true
 
-  local t_editor t_agent
-  t_editor="$(_resolve_editor 2>/dev/null)"
+  local t_agent
   t_agent="$(_resolve_ai 2>/dev/null)"
-  local t_editor_bin="${t_editor%% *}"
   local t_agent_bin="${t_agent%% *}"
   [[ -z "$t_agent_bin" ]] && t_agent_bin="shell"
 
@@ -5482,18 +5470,14 @@ NOTES
   # so the panes stay alive for inspection. Use pane IDs (not indices) to
   # match _setup_panes and avoid pane-base-index dependency.
   local lt_agent_cmd="tail -f /dev/null"
-  local lt_editor_cmd="tail -f /dev/null ."  # "." simulates how editor gets called
-  local _ltp1 _ltp2 _ltp3
+  local _ltp1 _ltp2
 
   _tmux new-session -d -s "$lt_session" -n "main" -c "$tmp" -x 220 -y 50
   _ltp1="$(_tmux list-panes -t "$lt_session:main" -F '#{pane_id}' | head -1)"
   _tmux send-keys   -t "$_ltp1" "$lt_agent_cmd" Enter
   _tmux select-pane -t "$_ltp1" -T "$t_agent_bin"
   _ltp2="$(_tmux split-window -t "$lt_session:main" -h -c "$tmp" -P -F '#{pane_id}')"
-  _tmux send-keys   -t "$_ltp2" "$lt_editor_cmd" Enter
-  _tmux select-pane -t "$_ltp2" -T "$t_editor_bin"
-  _ltp3="$(_tmux split-window -t "$_ltp2" -v -c "$tmp" -P -F '#{pane_id}')"
-  _tmux select-pane -t "$_ltp3" -T "shell"
+  _tmux select-pane -t "$_ltp2" -T "shell"
   _tmux select-pane -t "$_ltp1"
 
   sleep 0.3
@@ -5501,10 +5485,9 @@ NOTES
   local pane_titles
   pane_titles="$(_tmux list-panes -t "$lt_session:main" -F '#{pane_title}' 2>/dev/null)"
 
-  _t_check "T1: 3 panes created"                              test "$(echo "$pane_titles" | wc -l | tr -d ' ')" -eq 3
+  _t_check "T1: 2 panes created"                              test "$(echo "$pane_titles" | wc -l | tr -d ' ')" -eq 2
   _t_grep  "T2: pane 1 named after agent ('${t_agent_bin}')"  "$t_agent_bin"  echo "$pane_titles"
-  _t_grep  "T3: pane 2 named after editor ('${t_editor_bin}')" "$t_editor_bin" echo "$pane_titles"
-  _t_grep  "T4: pane 3 named 'shell'"                         "^shell$"       echo "$pane_titles"
+  _t_grep  "T3: pane 2 named 'shell'"                         "^shell$"       echo "$pane_titles"
 
   _tmux kill-session -t "$lt_session" 2>/dev/null || true
 
