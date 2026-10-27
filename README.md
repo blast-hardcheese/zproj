@@ -326,6 +326,9 @@ zproj --diagnostics                         Check environment for problems
 zproj --test                                Run the built-in test suite
 ```
 
+New worktrees start from the remote default branch even when its local branch
+has not been created yet. An existing local default branch still takes precedence.
+
 Run `zproj <command> --help` for details on any command.
 
 ## Self-test
