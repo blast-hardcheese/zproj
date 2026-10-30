@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.2"
+readonly VERSION="4.20.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -248,9 +248,9 @@ _warn_branch_mismatch() {
   actual_branch="$(git -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 0
   [[ -z "$actual_branch" ]] && return 0
   [[ "$actual_branch" == "HEAD" ]] && return 0
-  if [[ "$dir_name" != "$actual_branch" ]]; then
+  if [[ "$dir_name" != "$actual_branch" && "$dir_name" != "${actual_branch//\//-}" ]]; then
     warn "Worktree '${dir_name}' is on branch '${actual_branch}' (expected '${dir_name}')."
-    warn "  zproj assumes worktree directory name == branch name."
+    warn "  zproj expects the branch name with / replaced by - (or its legacy path)."
     warn "  Switch back: ${CYAN}git -C ${wt_dir} checkout ${dir_name}${RESET}"
   fi
   return 0
@@ -912,7 +912,7 @@ cmd_env() {
 # Given a user argument (relative name or path), resolve to an absolute path
 # and find the containing bare worktree root.
 #
-# Returns via globals: PROJECT_DIR, PARENT_DIR, WORKTREE_NAME, SESSION_NAME, WINDOW_NAME
+# Returns via globals: PROJECT_DIR, PARENT_DIR, WORKTREE_NAME, WORKTREE_BRANCH, SESSION_NAME, WINDOW_NAME
 resolve_project_dir() {
   local arg="$1"
   local resolved
@@ -957,6 +957,16 @@ resolve_project_dir() {
     exit 1
   fi
 
+  PARENT_DIR="$(cd "$PARENT_DIR" && pwd -P)"
+  PROJECT_DIR="$PARENT_DIR/$WORKTREE_NAME"
+  WORKTREE_BRANCH="$WORKTREE_NAME"
+  # Existing paths win so legacy nested worktrees and exact collision targets
+  # remain addressable. Only the worktree portion is flattened, never the root.
+  if [[ ! -e "$PROJECT_DIR" && ! -L "$PROJECT_DIR" ]]; then
+    WORKTREE_NAME="${WORKTREE_NAME//\//-}"
+    PROJECT_DIR="$PARENT_DIR/$WORKTREE_NAME"
+  fi
+
   SESSION_NAME="$(_tmux_session_name "$(basename "$PARENT_DIR")")"
   WINDOW_NAME="$WORKTREE_NAME"
 }
@@ -993,6 +1003,7 @@ _init_bare_structure() {
   local abs_dir="$1"
   local dir="$2"
   local main_branch="$3"
+  local main_name="${main_branch//\//-}"
 
   # Initialize a bare repo
   step "Initializing ${CYAN}${dir}/${BARE_DIR}${RESET}..."
@@ -1030,9 +1041,9 @@ _init_bare_structure() {
 
   # Add the worktree (branch now exists, so plain `worktree add` works on all
   # supported git versions).
-  (cd "$abs_dir" && git worktree add "$main_branch" "$main_branch" --quiet) || {
+  (cd "$abs_dir" && git worktree add "$main_name" "$main_branch" --quiet) || {
     _err "Failed to create '$main_branch' worktree."; return 1; }
-  dim "  Created worktree ${main_branch}/"
+  dim "  Created worktree ${main_name}/"
 }
 
 # Case 1: directory exists but contains no .git — plain directory adoption.
@@ -1040,6 +1051,7 @@ _case1_plain_dir() {
   local abs_dir="$1"
   local dir="$2"
   local main_branch="$3"
+  local main_name="${main_branch//\//-}"
 
   # Pre-flight: refuse if subdirectories contain their own .git entries.
   # A directory full of independent git repos is a parent/workspace directory,
@@ -1095,14 +1107,14 @@ _case1_plain_dir() {
 
   # Step 4: move backup contents into the main worktree — track each item
   # individually so rollback is lossless if the filesystem fails mid-way.
-  step "Moving original files into ${CYAN}${dir}/${main_branch}/${RESET}..."
+  step "Moving original files into ${CYAN}${dir}/${main_name}/${RESET}..."
   _dotglob_expand "$backup"
   local moved_items=()
   local move_failed=false
   local item
   for item in "${_GLOB_RESULT[@]+"${_GLOB_RESULT[@]}"}"; do
-    if mv "$item" "$abs_dir/$main_branch/"; then
-      moved_items+=("$abs_dir/$main_branch/$(basename "$item")")
+    if mv "$item" "$abs_dir/$main_name/"; then
+      moved_items+=("$abs_dir/$main_name/$(basename "$item")")
     else
       move_failed=true
       break
@@ -1118,7 +1130,7 @@ _case1_plain_dir() {
     mv "$backup" "$abs_dir"
     die "Failed to move files into worktree. Restored original directory."
   fi
-  dim "  Files moved into ${dir}/${main_branch}/"
+  dim "  Files moved into ${dir}/${main_name}/"
 
   # Step 5: remove backup (should be empty now)
   rmdir "$backup" 2>/dev/null || warn "Backup directory '${backup_name}' is not empty — remove it manually."
@@ -1126,7 +1138,7 @@ _case1_plain_dir() {
   echo ""
   info "Converted ${BOLD}${dir}${RESET} → bare worktree with ${BOLD}${main_branch}${RESET}"
   echo ""
-  echo -e "  ${DIM}Original files are now in ${dir}/${main_branch}/${RESET}"
+  echo -e "  ${DIM}Original files are now in ${dir}/${main_name}/${RESET}"
 
   # If the user ran 'zproj init .', their shell's CWD is now a stale inode
   # (we moved the directory and created a new one at the same path).
@@ -1185,6 +1197,7 @@ _case2_upgrade_repo() {
     warn "--main '${main_branch}' ignored for existing repo; using HEAD branch '${detected_branch}'"
   fi
   main_branch="$detected_branch"
+  local main_name="${main_branch//\//-}"
 
   step "HEAD branch: ${CYAN}${main_branch}${RESET}"
 
@@ -1286,8 +1299,8 @@ _case2_upgrade_repo() {
   dim "  Files moved to temporary location"
 
   # Step 8: create the main worktree (no checkout — files go in manually)
-  step "Creating worktree ${CYAN}${main_branch}/${RESET}..."
-  if ! (cd "$abs_dir" && git worktree add "$main_branch" "$main_branch" \
+  step "Creating worktree ${CYAN}${main_name}/${RESET}..."
+  if ! (cd "$abs_dir" && git worktree add "$main_name" "$main_branch" \
         --no-checkout --quiet 2>/dev/null); then
     # Restore files from tmp
     _dotglob_expand "$tmp_hold"
@@ -1299,17 +1312,17 @@ _case2_upgrade_repo() {
     $is_dirty && git -C "$abs_dir" stash pop --quiet 2>/dev/null || true
     die "Failed to create '$main_branch' worktree. Repository restored."
   fi
-  dim "  Worktree directory ${main_branch}/ created"
+  dim "  Worktree directory ${main_name}/ created"
 
   # Step 9: move working tree files into the main worktree — tracked per-item.
-  step "Moving files into ${CYAN}${dir}/${main_branch}/${RESET}..."
+  step "Moving files into ${CYAN}${dir}/${main_name}/${RESET}..."
   _dotglob_expand "$tmp_hold"
   local moved_to_wt=()
   local move10_failed=false
   for item in "${_GLOB_RESULT[@]+"${_GLOB_RESULT[@]}"}"; do
     name="$(basename "$item")"
-    if mv "$item" "$abs_dir/$main_branch/"; then
-      moved_to_wt+=("$abs_dir/$main_branch/$name")
+    if mv "$item" "$abs_dir/$main_name/"; then
+      moved_to_wt+=("$abs_dir/$main_name/$name")
     else
       move10_failed=true
       break
@@ -1327,16 +1340,16 @@ _case2_upgrade_repo() {
       mv "$item" "$abs_dir/" 2>/dev/null || true
     done
     rmdir "$tmp_hold" 2>/dev/null || true
-    (cd "$abs_dir" && git worktree remove --force "$main_branch" 2>/dev/null) || rm -rf "$abs_dir/$main_branch"
+    (cd "$abs_dir" && git worktree remove --force "$main_name" 2>/dev/null) || rm -rf "$abs_dir/$main_name"
     _rollback_upgrade "$abs_dir"
     $is_dirty && git -C "$abs_dir" stash pop --quiet 2>/dev/null || true
     die "Failed to move files into worktree. Repository restored."
   fi
   rmdir "$tmp_hold" 2>/dev/null || true
-  dim "  Files moved into ${dir}/${main_branch}/"
+  dim "  Files moved into ${dir}/${main_name}/"
 
   # Step 10: repair worktree links
-  git -C "$abs_dir/$main_branch" worktree repair 2>/dev/null || true
+  git -C "$abs_dir/$main_name" worktree repair 2>/dev/null || true
   dim "  Worktree links repaired"
 
   # Step 11: sync index with the files we moved in.
@@ -1344,17 +1357,17 @@ _case2_upgrade_repo() {
   # Populate it from HEAD (read-tree), then check out all tracked files so
   # the working tree and index agree. This is necessary so that stash pop
   # can apply cleanly on top of a known-good state.
-  git -C "$abs_dir/$main_branch" read-tree HEAD 2>/dev/null || true
-  git -C "$abs_dir/$main_branch" checkout -- . 2>/dev/null || true
+  git -C "$abs_dir/$main_name" read-tree HEAD 2>/dev/null || true
+  git -C "$abs_dir/$main_name" checkout -- . 2>/dev/null || true
 
   # Step 12: restore stash (if we stashed in step 2)
   if $is_dirty; then
     step "Restoring stashed working tree changes..."
-    if git -C "$abs_dir/$main_branch" stash pop --index --quiet 2>/dev/null; then
+    if git -C "$abs_dir/$main_name" stash pop --index --quiet 2>/dev/null; then
       dim "  Working tree changes restored"
     else
       warn "Could not automatically restore stash."
-      warn "Run manually: git -C '${dir}/${main_branch}' stash pop"
+      warn "Run manually: git -C '${dir}/${main_name}' stash pop"
     fi
   fi
 
@@ -1362,7 +1375,7 @@ _case2_upgrade_repo() {
   info "Upgraded ${BOLD}${dir}${RESET} to bare worktree structure"
   echo ""
   echo -e "  ${DIM}History, branches, remotes, tags, and stash preserved${RESET}"
-  echo -e "  ${DIM}Working tree is now at ${dir}/${main_branch}/${RESET}"
+  echo -e "  ${DIM}Working tree is now at ${dir}/${main_name}/${RESET}"
   _hint_next_steps "$dir"
 }
 
@@ -1473,7 +1486,7 @@ cmd_init() {
   fi
 
   echo ""
-  info "Initialized ${BOLD}${dir}${RESET} with worktree ${BOLD}${main_branch}${RESET}"
+  info "Initialized ${BOLD}${dir}${RESET} with worktree ${BOLD}${main_branch//\//-}${RESET}"
   echo ""
   _hint_next_steps "$dir"
 }
@@ -1580,16 +1593,18 @@ cmd_clone() {
       fi
     fi
 
+    local main_name="${main_branch//\//-}"
+
     # Create the main worktree — use return 1 (not die) so the caller
     # can clean up partial state before reporting the error.
-    if ! (cd "$abs_dir" && git worktree add "$main_branch" "$main_branch" --quiet 2>/dev/null) && \
-       ! (cd "$abs_dir" && git worktree add "$main_branch" "origin/$main_branch" --quiet 2>/dev/null); then
+    if ! (cd "$abs_dir" && git worktree add "$main_name" "$main_branch" --quiet 2>/dev/null) && \
+       ! (cd "$abs_dir" && git worktree add "$main_name" -b "$main_branch" "origin/$main_branch" --quiet 2>/dev/null); then
       _err "Failed to create '$main_branch' worktree."
       return 1
     fi
 
     # Set upstream tracking
-    git -C "$abs_dir/$main_branch" branch --set-upstream-to="origin/$main_branch" "$main_branch" --quiet 2>/dev/null || true
+    git -C "$abs_dir/$main_name" branch --set-upstream-to="origin/$main_branch" "$main_branch" --quiet 2>/dev/null || true
   }
 
   if ! _clone_steps; then
@@ -1598,7 +1613,7 @@ cmd_clone() {
   fi
 
   echo ""
-  info "Initialized ${BOLD}${dir}${RESET} with worktree ${BOLD}${main_branch}${RESET}"
+  info "Initialized ${BOLD}${dir}${RESET} with worktree ${BOLD}${main_branch//\//-}${RESET}"
   echo ""
   _hint_next_steps "$dir"
 }
@@ -1631,10 +1646,12 @@ cmd_create() {
   check_git
   resolve_project_dir "$dir"
 
-  [[ -d "$PROJECT_DIR" ]] && die "Worktree '$WORKTREE_NAME' already exists at $PROJECT_DIR"
+  local branch_name="$WORKTREE_BRANCH"
 
-  # Validate that the worktree name is a valid branch name
-  if ! git check-ref-format --branch "$WORKTREE_NAME" &>/dev/null; then
+  [[ -e "$PROJECT_DIR" || -L "$PROJECT_DIR" ]] && die "Worktree '$WORKTREE_NAME' already exists at $PROJECT_DIR"
+
+  # Validate before flattening can hide an invalid branch name.
+  if ! git check-ref-format --branch "$branch_name" &>/dev/null; then
     die "Invalid worktree/branch name: '$WORKTREE_NAME'."
   fi
 
@@ -1651,15 +1668,15 @@ cmd_create() {
 
   echo -e "Creating worktree ${BOLD}${WORKTREE_NAME}${RESET} from ${CYAN}${from_ref}${RESET}..."
 
-  (cd "$PARENT_DIR" && git worktree add "$WORKTREE_NAME" -b "$WORKTREE_NAME" "$from_ref" --quiet) ||
-    die "Failed to create worktree. Does the branch '$WORKTREE_NAME' already exist?"
+  (cd "$PARENT_DIR" && git worktree add "$WORKTREE_NAME" -b "$branch_name" "$from_ref" --quiet) ||
+    die "Failed to create worktree. Does the branch '$branch_name' already exist?"
 
   # Set upstream if the base was a remote branch
   if git -C "$PROJECT_DIR" rev-parse --verify "refs/remotes/origin/$from_ref" &>/dev/null; then
-    git -C "$PROJECT_DIR" branch --set-upstream-to="origin/$from_ref" "$WORKTREE_NAME" --quiet 2>/dev/null || true
+    git -C "$PROJECT_DIR" branch --set-upstream-to="origin/$from_ref" "$branch_name" --quiet 2>/dev/null || true
   fi
 
-  info "Created worktree ${BOLD}${WORKTREE_NAME}${RESET} → branch ${CYAN}${WORKTREE_NAME}${RESET}"
+  info "Created worktree ${BOLD}${WORKTREE_NAME}${RESET} → branch ${CYAN}${branch_name}${RESET}"
 }
 
 cmd_delete() {
@@ -1727,7 +1744,7 @@ cmd_delete() {
   # Only delete the branch when it matches the worktree name.
   # This prevents accidentally deleting a shared branch (e.g. 'main') when
   # the worktree directory was named differently from the branch it tracks.
-  if [[ -n "$branch_name" && "$branch_name" == "$WORKTREE_NAME" && "$branch_name" != "HEAD" ]]; then
+  if [[ -n "$branch_name" && ( "$branch_name" == "$WORKTREE_NAME" || "${branch_name//\//-}" == "$WORKTREE_NAME" ) && "$branch_name" != "HEAD" ]]; then
     if git -C "$PARENT_DIR" branch -d "$branch_name" &>/dev/null; then
       dim "  Deleted branch $branch_name"
     elif [[ "$force" == true ]]; then
@@ -1805,15 +1822,17 @@ cmd_fork() {
     warn "Only committed state will be forked."
   fi
 
-  # Resolve target — reuse PARENT_DIR from source resolution
-  local target_dir="$PARENT_DIR/$target"
-  local target_name="$target"
-
-  [[ -d "$target_dir" ]] && die "Worktree '$target_name' already exists."
-
-  if ! git check-ref-format --branch "$target_name" &>/dev/null; then
-    die "Invalid worktree/branch name: '$target_name'."
+  if ! git check-ref-format --branch "$target" &>/dev/null; then
+    die "Invalid worktree/branch name: '$target'."
   fi
+
+  # Resolve target — reuse PARENT_DIR from source resolution
+  resolve_project_dir "$PARENT_DIR/$target"
+  local target_dir="$PROJECT_DIR"
+  local target_name="$WORKTREE_NAME"
+  local target_branch="$target"
+
+  [[ -e "$target_dir" || -L "$target_dir" ]] && die "Worktree '$target_name' already exists."
 
   # Get source HEAD
   local source_head
@@ -1822,18 +1841,18 @@ cmd_fork() {
 
   echo -e "Forking ${BOLD}$(basename "$source_dir")${RESET} → ${BOLD}${target_name}${RESET} at ${CYAN}${source_head:0:8}${RESET}..."
 
-  (cd "$PARENT_DIR" && git worktree add "$target_name" -b "$target_name" "$source_head" --quiet) || \
-    die "Failed to create worktree. Does the branch '$target_name' already exist?"
+  (cd "$PARENT_DIR" && git worktree add "$target_name" -b "$target_branch" "$source_head" --quiet) || \
+    die "Failed to create worktree. Does the branch '$target_branch' already exist?"
 
   # Copy upstream tracking from source if it has one
   local upstream
   upstream="$(git -C "$source_dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)" || true
   if [[ -n "$upstream" ]]; then
-    git -C "$target_dir" branch --set-upstream-to="$upstream" "$target_name" --quiet 2>/dev/null || true
+    git -C "$target_dir" branch --set-upstream-to="$upstream" "$target_branch" --quiet 2>/dev/null || true
   fi
 
   # Record the source branch so `zproj update` can find it later.
-  git -C "$target_dir" config "branch.${target_name}.zprojSource" "$source_branch" 2>/dev/null || true
+  git -C "$target_dir" config "branch.${target_branch}.zprojSource" "$source_branch" 2>/dev/null || true
 
   info "Forked ${BOLD}$(basename "$source_dir")${RESET} → ${BOLD}${target_name}${RESET}"
 
@@ -2042,6 +2061,7 @@ cmd_update() {
   # silently merges stale commits from the recorded source ref while the user
   # is committing to a different branch in that directory.
   local source_wt="$parent_dir/$source_branch"
+  [[ -e "$source_wt" ]] || source_wt="$parent_dir/${source_branch//\//-}"
   if [[ -d "$source_wt" ]] && _git_is_registered_worktree "$parent_dir" "$source_wt"; then
     _warn_branch_mismatch "$source_wt"
   fi
@@ -2873,7 +2893,8 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME init <directory> [--main <branch>]
   ${BOLD}Exists, has .git/ directory (ordinary repo):${RESET}
     Upgrades the repo in-place. All history, branches, remotes, tags,
     stash, and working tree state are preserved. The working tree moves
-    to <directory>/<branch>/. The branch is auto-detected from HEAD.
+    to <directory>/<branch-with-slashes-replaced-by-dashes>/.
+    The branch is auto-detected from HEAD.
 
   The --main flag sets the branch name for new repos (default: main).
   It is ignored for the upgrade case (HEAD branch is always used).
@@ -5107,17 +5128,17 @@ STUB
   _t_grep  "clear error message"  "detached HEAD"  _zproj init u10
   _t_check ".git dir intact"      test -d "$tmp/u10/.git"
 
-  _section "U11 — upgrade: slash-named HEAD keeps nested worktree usable"
+  _section "U11 — upgrade: slash-named HEAD uses a flat worktree"
   _make_repo u11
   git -C "$tmp/u11" checkout -q -b feat/deep
   echo "local" > "$tmp/u11/local.txt"
   _zproj init u11 &>/dev/null
-  _t_check "U11: nested worktree created" test -d "$tmp/u11/feat/deep"
-  _t_check "U11: local file preserved" test -f "$tmp/u11/feat/deep/local.txt"
+  _t_check "U11: flat worktree created" test -d "$tmp/u11/feat-deep"
+  _t_check "U11: local file preserved" test -f "$tmp/u11/feat-deep/local.txt"
   _t_check "U11: branch remains feat/deep" \
-    bash -c '[[ "$(git -C "$1" branch --show-current)" == "feat/deep" ]]' -- "$tmp/u11/feat/deep"
-  _t_check "U11: nested worktree registered" \
-    _git_is_registered_worktree "$tmp/u11" "$tmp/u11/feat/deep"
+    bash -c '[[ "$(git -C "$1" branch --show-current)" == "feat/deep" ]]' -- "$tmp/u11/feat-deep"
+  _t_check "U11: flat worktree registered" \
+    _git_is_registered_worktree "$tmp/u11" "$tmp/u11/feat-deep"
 
   # ── Section: _resolve_editor ──────────────────────────────────────────────
   # E1–E6 require nvim and code binaries in PATH. Skip gracefully if absent.
@@ -6086,7 +6107,8 @@ NOTES
 
   _section "B12 — nested branch worktree resolves from path and cwd"
   local b12_root="$tmp/b12"
-  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init b12 --main feat/deep &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init b12 &>/dev/null ) || true
+  git -C "$b12_root" worktree add feat/deep -b feat/deep main --quiet
   local b12_wt="$b12_root/feat/deep"
   _t_check "B12: nested worktree created" test -d "$b12_wt"
   _t_check "B12: nested worktree registered" _git_is_registered_worktree "$b12_root" "$b12_wt"
@@ -6106,8 +6128,8 @@ NOTES
   local b12_create_exit=0
   ( cd "$b12_root" && "$BASH" "$_ZPROJ_SELF" create feat/next &>/dev/null ) || b12_create_exit=$?
   _t_check "B12: create accepts nested branch name" test "$b12_create_exit" -eq 0
-  _t_check "B12: created nested branch matches worktree" \
-    bash -c '[[ "$(git -C "$1" branch --show-current)" == "feat/next" ]]' -- "$b12_root/feat/next"
+  _t_check "B12: created flat worktree keeps branch name" \
+    bash -c '[[ "$(git -C "$1" branch --show-current)" == "feat/next" ]]' -- "$b12_root/feat-next"
   if command -v tmux &>/dev/null; then
     local b12_launch_exit=0
     ( ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" "$b12_wt/" &>/dev/null ) || b12_launch_exit=$?
@@ -6127,6 +6149,57 @@ NOTES
   _t_check "B12: delete accepts nested worktree" test "$b12_delete_exit" -eq 0
   _t_check "B12: nested branch removed" \
     bash -c '! git -C "$1" show-ref --verify --quiet refs/heads/feat/next' -- "$b12_root"
+
+  _section "B13 — slash names normalize without moving legacy worktrees"
+  local b13_root="$tmp/b13" b13_out=""
+  _zproj init b13 --main feat/base &>/dev/null
+  b13_root="$(cd "$b13_root" && pwd -P)"
+  _t_check "B13: init creates flat directory" test -d "$b13_root/feat-base"
+  _zproj create b13/feat/foo/bar/baz &>/dev/null || true
+  _t_check "B13: create flattens every slash" test -d "$b13_root/feat-foo-bar-baz"
+  _t_grep "B13: branch keeps slashes" '^feat/foo/bar/baz$' \
+    git -C "$b13_root/feat-foo-bar-baz" branch --show-current
+  b13_out="$(resolve_project_dir "$b13_root/feat/foo/bar/baz" && echo "$PROJECT_DIR")"
+  _t_check "B13: slash argument resolves flat path" test "$b13_out" = "$b13_root/feat-foo-bar-baz"
+  b13_out="$(cd "$b13_root/feat-base" && resolve_project_dir ../feat/foo/bar/baz && echo "$PROJECT_DIR|$SESSION_NAME")"
+  _t_check "B13: relative slash path keeps canonical root and session" \
+    test "$b13_out" = "$b13_root/feat-foo-bar-baz|b13"
+  _t_check "B13: no nested target created" test ! -e "$b13_root/feat/foo"
+  _t_check "B13: normalized name collision refused" \
+    test "$(_zproj_exit create b13/feat-foo-bar-baz)" -ne 0
+  git -C "$b13_root" worktree add feat/old -b feat/old feat/base --quiet
+  git -C "$b13_root" worktree add feat-old -b other feat/base --quiet
+  b13_out="$(resolve_project_dir "$b13_root/feat/old" && echo "$PROJECT_DIR")"
+  _t_check "B13: exact legacy path wins collision" test "$b13_out" = "$b13_root/feat/old"
+  _zproj delete b13/feat/old &>/dev/null || true
+  _t_check "B13: legacy delete preserves colliding flat worktree" test -d "$b13_root/feat-old"
+  _t_check "B13: legacy branch removed" \
+    bash -c '! git -C "$1" show-ref --verify --quiet refs/heads/feat/old' -- "$b13_root"
+  b13_out="$(_warn_branch_mismatch "$b13_root/feat-foo-bar-baz" 2>&1)"
+  _t_check "B13: normalized branch does not warn" test -z "$b13_out"
+  _zproj delete b13/feat/foo/bar/baz &>/dev/null || true
+  _t_check "B13: delete removes normalized branch" \
+    bash -c '! git -C "$1" show-ref --verify --quiet refs/heads/feat/foo/bar/baz' -- "$b13_root"
+  if command -v tmux &>/dev/null; then
+    ( ZPROJ_TEST_NO_ATTACH=1 _zproj fork b13/feat/base feat/fork/deep ) &>/dev/null || true
+    _t_check "B13: fork creates flat directory" test -d "$b13_root/feat-fork-deep"
+    _t_grep "B13: fork keeps branch name" '^feat/fork/deep$' \
+      git -C "$b13_root/feat-fork-deep" branch --show-current
+    _tmux kill-session -t b13 2>/dev/null || true
+  else
+    _t_skip "B13: fork normalization (tmux not in PATH)"
+  fi
+  _zproj clone "$b13_root/.bare" b13clone &>/dev/null
+  _t_check "B13: clone creates flat directory" test -d "$tmp/b13clone/feat-base"
+  if command -v tmux &>/dev/null; then
+    _t_check "B13: fork cannot normalize traversal into another project" \
+      test "$(_zproj_exit fork b13/feat/base ../b13clone/escaped)" -ne 0
+    _t_check "B13: fork leaves other project untouched" test ! -e "$tmp/b13clone/escaped"
+  fi
+  mkdir "$tmp/b13plain"
+  echo local > "$tmp/b13plain/local.txt"
+  _zproj init b13plain --main feat/base &>/dev/null
+  _t_check "B13: plain conversion preserves files in flat directory" test -f "$tmp/b13plain/feat-base/local.txt"
 
   # ── Section: TM — tmux session name sanitisation ─────────────────────────
   # Bug: '.' and ':' in a project directory name are tmux target-syntax

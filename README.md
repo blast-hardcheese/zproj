@@ -97,25 +97,29 @@ my-project/
   .git                pointer: "gitdir: ./.bare"
   main/               worktree for the main branch
   feature-auth/       worktree for feature-auth branch
-  feat/my-feature/    worktree for feat/my-feature branch
+  feat-my-feature/    worktree for feat/my-feature branch
   fix-bug/            worktree for fix-bug branch
 ```
 
 Each worktree directory is a fully independent working tree. You can have
 multiple branches open simultaneously without stashing or switching.
 
-> **Invariant**: each worktree path relative to the project root matches its branch name
-> (`feature-auth/` is on branch `feature-auth`, `main/` is on branch `main`).
-> zproj enforces this on `create`/`fork`. If you manually `git checkout` a
-> different branch inside a worktree, `zproj launch`, `fork`, `join`, and
-> `update` will warn — operations like `update` resolve the source by branch
-> name and will silently target the wrong branch otherwise.
+> **Naming**: new worktree directories use the branch name with every `/`
+> replaced by `-` (`feat/my-feature` lives in `feat-my-feature/`). Git branch
+> names keep their slashes. If you manually check out an unrelated branch,
+> `zproj launch`, `fork`, `join`, and `update` warn about the mismatch.
 
-Branch names containing `/` use nested directories. For example,
+This applies to `init`, `clone`, `create`, and `fork`. For example,
 `zproj init my-project --main feat/my-feature` creates
-`my-project/feat/my-feature/`. You can open that worktree with
-`zproj my-project/feat/my-feature` or, from the project root,
-`zproj feat/my-feature`.
+`my-project/feat-my-feature/`. From the project root, either
+`zproj feat/my-feature` or `zproj feat-my-feature` opens it.
+
+Existing nested worktrees stay in place and remain usable with their original
+paths. An existing path takes precedence over its flattened spelling, so
+`zproj feat/my-feature` still opens a legacy `feat/my-feature/` worktree when
+one exists. If multiple branch names normalize to the same directory, creation
+fails rather than reusing or overwriting that directory. Use the exact flat
+path to select it when both layouts exist.
 
 ### Tmux layout
 
